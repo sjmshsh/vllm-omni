@@ -102,6 +102,12 @@ def thinker2talker_async_chunk(
     3. Package for talker with additional information
     """
 
+    # Conditionally keep tensors on GPU when connector supports D2D transfer
+    _keep_on_gpu = getattr(
+        getattr(transfer_manager, "connector", None), "supports_gpu_tensor", False
+    )
+    _to_out = (lambda t: t.detach()) if _keep_on_gpu else (lambda t: t.detach().cpu())
+
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
     if chunk_id == 0:
@@ -111,14 +117,14 @@ def thinker2talker_async_chunk(
         all_token_ids = _ensure_list(all_token_ids)
         prompt_token_ids = _ensure_list(prompt_token_ids)
         talker_additional_info = {
-            "thinker_prefill_embeddings": pooling_output.get("0").detach().cpu(),
-            "thinker_hidden_states": pooling_output.get("24").detach().cpu(),
+            "thinker_prefill_embeddings": _to_out(pooling_output.get("0")),
+            "thinker_hidden_states": _to_out(pooling_output.get("24")),
             "thinker_sequences": all_token_ids,
             "thinker_input_ids": prompt_token_ids,
             # Provide thinker-side TTS token embeddings for talker projection
-            "tts_bos_embed": pooling_output.get("tts_bos_embed").detach().cpu(),
-            "tts_eos_embed": pooling_output.get("tts_eos_embed").detach().cpu(),
-            "tts_pad_embed": pooling_output.get("tts_pad_embed").detach().cpu(),
+            "tts_bos_embed": _to_out(pooling_output.get("tts_bos_embed")),
+            "tts_eos_embed": _to_out(pooling_output.get("tts_eos_embed")),
+            "tts_pad_embed": _to_out(pooling_output.get("tts_pad_embed")),
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
         speaker = extract_speaker_from_request(request)
@@ -161,12 +167,12 @@ def thinker2talker_async_chunk(
 
         if output_token_ids:
             talker_additional_info["override_keys"] = ["thinker_decode_embeddings", "thinker_output_token_ids"]
-            talker_additional_info["thinker_decode_embeddings"] = pooling_output.get("0").detach().cpu()
+            talker_additional_info["thinker_decode_embeddings"] = _to_out(pooling_output.get("0"))
             talker_additional_info["thinker_output_token_ids"] = output_token_ids
         else:
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
-            talker_additional_info["thinker_prefill_embeddings"] = pooling_output.get("0").detach().cpu()
-            talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
+            talker_additional_info["thinker_prefill_embeddings"] = _to_out(pooling_output.get("0"))
+            talker_additional_info["thinker_hidden_states"] = _to_out(pooling_output.get("24"))
 
     return talker_additional_info
 

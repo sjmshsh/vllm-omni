@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from .connectors.base import OmniConnectorBase
+from .connectors.cuda_ipc_connector import CudaIPCConnector
 from .connectors.mooncake_store_connector import MooncakeStoreConnector
 from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.yuanrong_connector import YuanrongConnector
@@ -34,6 +35,7 @@ __all__ = [
     # Factory
     "OmniConnectorFactory",
     # Specific implementations
+    "CudaIPCConnector",
     "MooncakeConnector",  # compat alias → MooncakeStoreConnector
     "MooncakeStoreConnector",
     "MooncakeTransferEngineConnector",

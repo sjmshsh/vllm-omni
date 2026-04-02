@@ -17,6 +17,12 @@ class OmniConnectorBase(ABC):
     # payloads directly (e.g. RDMA) should override this to True.
     supports_raw_data: bool = False
 
+    # Whether the connector can transfer GPU tensors directly (D2D)
+    # without requiring CPU bounce (D2H + H2D).  Connectors that use
+    # CUDA IPC or similar GPU-direct paths should override this to True.
+    # When True, payload processors may skip .cpu() on tensors.
+    supports_gpu_tensor: bool = False
+
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.
