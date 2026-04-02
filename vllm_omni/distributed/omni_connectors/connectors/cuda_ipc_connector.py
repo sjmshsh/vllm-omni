@@ -6,13 +6,16 @@
 Split-plane architecture:
   - Data Plane: GPU tensors stay on sender GPU. CUDA IPC handles (64 bytes
     each) are passed to the receiver, which opens them and performs a D2D
-    copy via NVLink / PCIe P2P.
+    copy via NVLink / PCIe P2P using raw cudart APIs.
   - Control Plane: IPC handles + small CPU data serialized via /dev/shm
-    (< 1 KB per chunk).
+    (< 1 KB per chunk), reusing the existing shm_write_bytes/shm_read_bytes
+    utilities for consistency with SharedMemoryConnector.
 """
 
+import ctypes
 import fcntl
-import struct
+import hashlib
+import os
 import threading
 import time as _time_mod
 from multiprocessing import shared_memory as shm_pkg
@@ -20,33 +23,31 @@ from typing import Any
 
 import torch
 
+from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
+
 from ..utils.logging import get_connector_logger
+from ..utils.serialization import OmniSerializer
 from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 
-# Magic bytes to identify GPU tensor entries in the serialized control payload
-_GPU_TENSOR_MARKER = b"__cuda_ipc__"
-
-# ACK value written by receiver to signal D2D copy completion
-_ACK_DONE = b"\x01"
+# Marker key embedded in serialized dicts to identify IPC tensor entries
+_GPU_TENSOR_MARKER = "__cuda_ipc_tensor__"
 
 
-def _shm_name(key: str, suffix: str = "") -> str:
-    """Generate a deterministic SHM segment name from a connector key."""
-    # SHM names must be <= 255 chars and start with /
-    name = f"cipc_{key}{suffix}"
-    # Replace characters illegal in POSIX shm names
-    return name.replace("/", "_").replace("@", "_")[:200]
+class _CudaIpcMemHandle(ctypes.Structure):
+    """Wrapper for the 64-byte opaque CUDA IPC memory handle."""
+
+    _fields_ = [("reserved", ctypes.c_char * 64)]
 
 
 class CudaIPCConnector(OmniConnectorBase):
-    """Connector for direct GPU-to-GPU transfer via CUDA IPC + NVLink.
+    """Single-node CUDA IPC connector for stage-to-stage payload transfer.
 
-    GPU tensors are transferred using CUDA IPC memory handles, which allow
-    cross-process access to GPU memory.  The receiver opens the handle and
-    performs a D2D copy (leveraging NVLink when available).  Non-tensor data
-    (token IDs, flags, etc.) is serialized and passed via shared memory.
+    GPU tensors are transferred using raw cudaIpcGetMemHandle /
+    cudaIpcOpenMemHandle calls (via ctypes) for maximum stability across
+    PyTorch versions.  Non-tensor data is serialized via OmniSerializer and
+    passed through /dev/shm.
 
     An ACK-based lifecycle ensures the sender holds tensor references until
     the receiver completes the D2D copy.
@@ -55,56 +56,83 @@ class CudaIPCConnector(OmniConnectorBase):
     supports_gpu_tensor: bool = True
 
     def __init__(self, config: dict[str, Any]):
-        self._closed = False
         self.config = config
-        self.stage_id = config.get("stage_id", -1)
-
-        # Device configuration
-        local_device = config.get("local_device", "auto")
-        if local_device == "auto":
-            self._local_device = None  # resolved lazily
-        else:
-            self._local_device = torch.device(local_device)
-
-        # Tensor lifetime: fallback timeout for held tensor refs
-        self._tensor_lifetime_sec = float(config.get("tensor_lifetime_sec", 30))
-
-        # Role: sender or receiver (injected by orchestration layer)
-        role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver"}:
-            raise ValueError(f"Invalid role={role!r}. Expected 'sender' or 'receiver'.")
-        self._role = role
+        self.stage_id = int(config.get("stage_id", -1))
+        self.role = str(config.get("role", "sender")).lower()
+        if self.role not in {"sender", "receiver"}:
+            raise ValueError(f"Invalid role={self.role!r}. Expected 'sender' or 'receiver'.")
+        self.tensor_lifetime_sec = float(config.get("tensor_lifetime_sec", 30.0))
+        self.local_device = self._resolve_local_device(config.get("local_device", "auto"))
+        self._closed = False
+        self._cudart = None
 
         # Sender state: held tensor references keyed by put_key
-        # Each entry: (tensor_refs: list[torch.Tensor], created_at: float)
-        self._held_tensors: dict[str, tuple[list[torch.Tensor], float]] = {}
+        # Each entry: (created_at: float, holders: list[torch.Tensor])
+        self._held_tensors: dict[str, tuple[float, list[torch.Tensor]]] = {}
         self._held_lock = threading.Lock()
-
-        # Start background cleanup thread for stale tensor refs
         self._stop_event = threading.Event()
-        self._cleanup_thread = threading.Thread(
-            target=self._cleanup_loop, daemon=True, name="cuda-ipc-cleanup"
-        )
-        self._cleanup_thread.start()
+        self._ack_thread: threading.Thread | None = None
 
-        # Metrics
         self._metrics = {
             "puts": 0,
             "gets": 0,
+            "bytes_transferred": 0,
             "gpu_tensors_transferred": 0,
-            "bytes_via_shm": 0,
-            "ack_received": 0,
-            "ttl_expired": 0,
+            "acks": 0,
+            "ack_timeouts": 0,
+            "errors": 0,
         }
 
+        if not torch.cuda.is_available():
+            raise RuntimeError("CudaIPCConnector requires CUDA runtime.")
+        self._cudart = torch.cuda.cudart()
+
         # Validate P2P access (best-effort; may not have CUDA context yet)
-        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        if torch.cuda.device_count() > 1:
             self._validate_p2p_access()
 
+        # Sender starts background ACK drain thread
+        if self.role == "sender":
+            self._ack_thread = threading.Thread(
+                target=self._ack_loop, daemon=True, name="cuda-ipc-ack-loop"
+            )
+            self._ack_thread.start()
+
         logger.info(
-            f"CudaIPCConnector initialized: role={self._role}, "
-            f"local_device={local_device}, tensor_lifetime={self._tensor_lifetime_sec}s"
+            f"CudaIPCConnector initialized: role={self.role}, "
+            f"local_device={self.local_device}, tensor_lifetime={self.tensor_lifetime_sec}s"
         )
+
+    # ------------------------------------------------------------------
+    # Device & naming helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_local_device(local_device_cfg: str | int) -> torch.device:
+        if local_device_cfg == "auto":
+            return torch.device("cuda", torch.cuda.current_device())
+        if isinstance(local_device_cfg, int):
+            return torch.device("cuda", local_device_cfg)
+        if isinstance(local_device_cfg, str):
+            if local_device_cfg.startswith("cuda"):
+                return torch.device(local_device_cfg)
+            return torch.device("cuda", int(local_device_cfg))
+        return torch.device("cuda", torch.cuda.current_device())
+
+    @staticmethod
+    def _safe_name(prefix: str, key: str) -> str:
+        """Generate a short, collision-free SHM name via SHA1 hash."""
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
+        return f"{prefix}_{digest}"
+
+    def _payload_name(self, key: str) -> str:
+        return self._safe_name("cudaipc", key)
+
+    def _ack_name(self, key: str) -> str:
+        return self._safe_name("cudaipc_ack", key)
+
+    def _lock_file(self, name: str) -> str:
+        return f"/dev/shm/{name}.lock"
 
     def _validate_p2p_access(self) -> None:
         """Check that CUDA P2P access is available between GPUs."""
@@ -120,11 +148,101 @@ class CudaIPCConnector(OmniConnectorBase):
                 f"D2D copy will fall back to PCIe staging (slower than NVLink)."
             )
 
-    @property
-    def local_device(self) -> torch.device:
-        if self._local_device is None:
-            self._local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        return self._local_device
+    # ------------------------------------------------------------------
+    # Low-level CUDA IPC via ctypes (stable across PyTorch versions)
+    # ------------------------------------------------------------------
+
+    def _get_ipc_handle(self, ptr: int) -> bytes:
+        """Obtain a 64-byte CUDA IPC memory handle for a device pointer."""
+        handle = _CudaIpcMemHandle()
+        ret = self._cudart.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(ptr))
+        if ret != 0:
+            raise RuntimeError(f"cudaIpcGetMemHandle failed with code {ret}")
+        return bytes(handle.reserved)
+
+    def _open_ipc_ptr(self, handle_bytes: bytes) -> ctypes.c_void_p:
+        """Open a CUDA IPC handle and return the mapped device pointer."""
+        handle = _CudaIpcMemHandle()
+        handle.reserved = handle_bytes
+        dev_ptr = ctypes.c_void_p()
+        # 1 = cudaIpcMemLazyEnablePeerAccess
+        ret = self._cudart.cudaIpcOpenMemHandle(
+            ctypes.byref(dev_ptr), handle, ctypes.c_uint(1)
+        )
+        if ret != 0:
+            raise RuntimeError(f"cudaIpcOpenMemHandle failed with code {ret}")
+        return dev_ptr
+
+    def _close_ipc_ptr(self, dev_ptr: ctypes.c_void_p) -> None:
+        """Release a mapped CUDA IPC device pointer."""
+        ret = self._cudart.cudaIpcCloseMemHandle(dev_ptr)
+        if ret != 0:
+            logger.warning("cudaIpcCloseMemHandle failed with code %s", ret)
+
+    def _d2d_copy(self, dst_ptr: int, src_ptr: ctypes.c_void_p, nbytes: int) -> None:
+        """Perform a D2D memcpy via cudart."""
+        # cudaMemcpyDeviceToDevice = 3
+        ret = self._cudart.cudaMemcpy(
+            ctypes.c_void_p(dst_ptr), src_ptr, ctypes.c_size_t(nbytes), ctypes.c_int(3)
+        )
+        if ret != 0:
+            raise RuntimeError(f"cudaMemcpy(D2D) failed with code {ret}")
+
+    # ------------------------------------------------------------------
+    # Recursive encode / decode (handles nested dict/list/tuple)
+    # ------------------------------------------------------------------
+
+    def _encode_gpu_tensor(self, tensor: torch.Tensor) -> tuple[dict[str, Any], torch.Tensor]:
+        """Encode a single CUDA tensor into an IPC metadata dict."""
+        t = tensor.detach().contiguous()
+        handle = self._get_ipc_handle(t.data_ptr())
+        return {
+            _GPU_TENSOR_MARKER: True,
+            "shape": list(t.shape),
+            "dtype": str(t.dtype).removeprefix("torch."),
+            "nbytes": int(t.nbytes),
+            "handle": handle,
+        }, t
+
+    def _walk_encode(self, obj: Any, holders: list[torch.Tensor]) -> Any:
+        """Recursively walk a data structure, replacing CUDA tensors with IPC metadata."""
+        if isinstance(obj, torch.Tensor) and obj.is_cuda:
+            encoded, holder = self._encode_gpu_tensor(obj)
+            holders.append(holder)
+            return encoded
+        if isinstance(obj, dict):
+            return {k: self._walk_encode(v, holders) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._walk_encode(v, holders) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._walk_encode(v, holders) for v in obj)
+        return obj
+
+    def _decode_gpu_tensor(self, meta: dict[str, Any]) -> torch.Tensor:
+        """Decode an IPC metadata dict into a local GPU tensor via D2D copy."""
+        shape = tuple(meta["shape"])
+        dtype = getattr(torch, meta["dtype"])
+        nbytes = int(meta["nbytes"])
+        dst = torch.empty(shape, dtype=dtype, device=self.local_device)
+        src_ptr = self._open_ipc_ptr(meta["handle"])
+        try:
+            self._d2d_copy(dst.data_ptr(), src_ptr, nbytes)
+        finally:
+            self._close_ipc_ptr(src_ptr)
+        self._metrics["gpu_tensors_transferred"] += 1
+        return dst
+
+    def _walk_decode(self, obj: Any) -> Any:
+        """Recursively walk a data structure, restoring CUDA tensors from IPC metadata."""
+        if isinstance(obj, dict) and obj.get(_GPU_TENSOR_MARKER):
+            return self._decode_gpu_tensor(obj)
+        if isinstance(obj, dict):
+            return {k: self._walk_decode(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._walk_decode(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._walk_decode(v) for v in obj)
+        return obj
 
     # ------------------------------------------------------------------
     # put() — Sender side
@@ -139,92 +257,42 @@ class CudaIPCConnector(OmniConnectorBase):
     ) -> tuple[bool, int, dict[str, Any] | None]:
         """Store data for D2D transfer.
 
-        GPU tensors in *data* (expected to be a dict) are extracted: for each
-        tensor we obtain a CUDA IPC handle and record the tensor shape/dtype.
-        The IPC metadata plus all non-tensor values are serialized and written
-        to a shared memory segment.  The original GPU tensors are held alive
-        in ``_held_tensors`` until the receiver ACKs.
+        GPU tensors in *data* are recursively replaced with CUDA IPC handle
+        metadata.  The transformed structure is serialized via OmniSerializer
+        and written to a shared memory segment.  Original GPU tensors are held
+        alive in ``_held_tensors`` until the receiver ACKs.
         """
         if self._closed:
-            raise RuntimeError("CudaIPCConnector is closed")
-
-        internal_key = self._make_key(put_key, from_stage, to_stage)
-
-        try:
-            gpu_meta, cpu_data, tensor_refs = self._split_data(data)
-
-            # Serialize the control payload: gpu metadata + cpu-only data
-            control_payload = self.serialize_obj({
-                "gpu_meta": gpu_meta,
-                "cpu_data": cpu_data,
-            })
-            size = len(control_payload)
-
-            # Write control payload to SHM
-            shm_name = _shm_name(internal_key)
-            self._shm_write(shm_name, control_payload)
-
-            # Hold tensor references until receiver ACKs
-            if tensor_refs:
-                with self._held_lock:
-                    # Release old refs if key already exists
-                    old = self._held_tensors.pop(internal_key, None)
-                    if old:
-                        logger.warning(f"Overwriting held tensors for key={internal_key}")
-                    self._held_tensors[internal_key] = (tensor_refs, _time_mod.monotonic())
-
-            self._metrics["puts"] += 1
-            self._metrics["bytes_via_shm"] += size
-
-            metadata = {
-                "shm_name": shm_name,
-                "control_size": size,
-                "has_gpu_tensors": len(gpu_meta) > 0,
-            }
-            return True, size, metadata
-
-        except Exception as e:
-            logger.error(f"CudaIPCConnector put failed for {internal_key}: {e}", exc_info=True)
             return False, 0, None
 
-    def _split_data(self, data: Any) -> tuple[list[dict], dict, list[torch.Tensor]]:
-        """Separate GPU tensors from CPU data in a dict payload.
+        try:
+            # Opportunistically drain ACKs to release memory early
+            self._drain_acks()
 
-        Returns:
-            gpu_meta: list of {key, handle, shape, dtype, device} for each GPU tensor
-            cpu_data: dict of non-tensor items + CPU tensors (moved to CPU for serialization)
-            tensor_refs: list of original GPU tensors (to be held alive)
-        """
-        if not isinstance(data, dict):
-            return [], data, []
+            holders: list[torch.Tensor] = []
+            encoded_obj = self._walk_encode(data, holders)
+            payload = OmniSerializer.serialize(encoded_obj)
+            size = len(payload)
 
-        gpu_meta: list[dict] = []
-        cpu_data: dict[str, Any] = {}
-        tensor_refs: list[torch.Tensor] = []
+            payload_name = self._payload_name(put_key)
+            lock_file = self._lock_file(payload_name)
+            with open(lock_file, "wb+") as lockf:
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+                meta = shm_write_bytes(payload, name=payload_name)
+                fcntl.flock(lockf, fcntl.LOCK_UN)
 
-        for key, value in data.items():
-            if isinstance(value, torch.Tensor) and value.is_cuda:
-                # Ensure tensor is contiguous for IPC
-                t = value.contiguous()
-                # Synchronize the stream to make sure tensor data is ready
-                with torch.cuda.device(t.device):
-                    torch.cuda.current_stream().synchronize()
+            if holders:
+                with self._held_lock:
+                    self._held_tensors[put_key] = (_time_mod.time(), holders)
 
-                # Get IPC handle
-                handle = t.storage()._share_cuda_()
-                # handle is a tuple: (device, handle_bytes, storage_size_bytes, storage_offset_bytes)
-                gpu_meta.append({
-                    "key": key,
-                    "ipc_handle": handle,
-                    "shape": list(t.shape),
-                    "dtype": str(t.dtype),
-                    "device": str(t.device),
-                })
-                tensor_refs.append(t)
-            else:
-                cpu_data[key] = value
+            self._metrics["puts"] += 1
+            self._metrics["bytes_transferred"] += size
+            return True, size, {"shm": meta, "size": size}
 
-        return gpu_meta, cpu_data, tensor_refs
+        except Exception as e:
+            self._metrics["errors"] += 1
+            logger.error("CudaIPCConnector put failed for %s: %s", put_key, e, exc_info=True)
+            return False, 0, None
 
     # ------------------------------------------------------------------
     # get() — Receiver side
@@ -239,191 +307,96 @@ class CudaIPCConnector(OmniConnectorBase):
     ) -> tuple[Any, int] | None:
         """Retrieve data via D2D copy.
 
-        Reads the control payload from SHM, then for each GPU tensor:
-        opens the CUDA IPC handle and performs a D2D copy to the local GPU.
-        After all copies complete, sends an ACK via SHM.
+        Reads the control payload from SHM, then recursively restores CUDA
+        tensors by opening IPC handles and performing D2D copies to the local
+        GPU.  After all copies complete, sends an ACK via SHM so the sender
+        can release its tensor references.
         """
         if self._closed:
-            raise RuntimeError("CudaIPCConnector is closed")
+            return None
 
-        internal_key = self._make_key(get_key, from_stage, to_stage)
-        shm_name = _shm_name(internal_key)
-
+        payload_name = self._payload_name(get_key)
+        lock_file = self._lock_file(payload_name)
         try:
-            control_bytes = self._shm_read(shm_name)
-            if control_bytes is None:
-                return None
+            with open(lock_file, "rb+") as lockf:
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+                seg = shm_pkg.SharedMemory(name=payload_name)
+                try:
+                    shm_handle = {"name": payload_name, "size": seg.size}
+                finally:
+                    seg.close()
+                data_bytes = shm_read_bytes(shm_handle)
+                fcntl.flock(lockf, fcntl.LOCK_UN)
 
-            control = self.deserialize_obj(control_bytes)
-            gpu_meta = control.get("gpu_meta", [])
-            cpu_data = control.get("cpu_data", {})
-            size = len(control_bytes)
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
 
-            # Reconstruct GPU tensors via IPC
-            result = dict(cpu_data) if isinstance(cpu_data, dict) else cpu_data
-            if gpu_meta and isinstance(result, dict):
-                target_device = self.local_device
-                for entry in gpu_meta:
-                    key = entry["key"]
-                    ipc_handle = entry["ipc_handle"]
-                    shape = entry["shape"]
-                    dtype = getattr(torch, entry["dtype"].replace("torch.", ""))
+            raw_obj = OmniSerializer.deserialize(data_bytes)
+            obj = self._walk_decode(raw_obj)
+            torch.cuda.synchronize(self.local_device)
+            self._send_ack(get_key)
 
-                    # Reconstruct storage from IPC handle
-                    # ipc_handle is (device, handle_bytes, storage_size_bytes, storage_offset_bytes)
-                    storage = torch.UntypedStorage._new_shared_cuda(
-                        ipc_handle[0],  # device
-                        ipc_handle[1],  # handle bytes
-                        ipc_handle[2],  # storage size bytes
-                        ipc_handle[3],  # storage offset bytes
-                    )
-
-                    # Create tensor from the shared storage (on sender's GPU)
-                    src_tensor = torch.tensor([], dtype=dtype).set_(storage).reshape(shape)
-
-                    # D2D copy to local GPU
-                    dst_tensor = torch.empty(shape, dtype=dtype, device=target_device)
-                    dst_tensor.copy_(src_tensor, non_blocking=True)
-
-                    # Synchronize to ensure copy is complete before releasing
-                    with torch.cuda.device(target_device):
-                        torch.cuda.current_stream().synchronize()
-
-                    result[key] = dst_tensor
-                    self._metrics["gpu_tensors_transferred"] += 1
-
-            # Send ACK to sender
-            self._send_ack(internal_key)
-
+            size = len(data_bytes)
             self._metrics["gets"] += 1
-            self._metrics["bytes_via_shm"] += size
-            return result, size
+            self._metrics["bytes_transferred"] += size
+            return obj, size
 
         except FileNotFoundError:
-            # SHM segment not yet created by sender
             return None
         except Exception as e:
-            logger.error(f"CudaIPCConnector get failed for {internal_key}: {e}", exc_info=True)
+            self._metrics["errors"] += 1
+            logger.error("CudaIPCConnector get failed for %s: %s", get_key, e, exc_info=True)
             return None
 
     # ------------------------------------------------------------------
     # ACK mechanism
     # ------------------------------------------------------------------
 
-    def _send_ack(self, internal_key: str) -> None:
+    def _send_ack(self, key: str) -> None:
         """Write an ACK to SHM to signal the sender that D2D copy is done."""
-        ack_name = _shm_name(internal_key, suffix="_ack")
+        ack_name = self._ack_name(key)
         try:
-            self._shm_write(ack_name, _ACK_DONE)
+            shm_write_bytes(b"1", name=ack_name)
         except Exception as e:
-            logger.warning(f"Failed to send ACK for {internal_key}: {e}")
+            logger.debug("Failed to write ACK for %s: %s", key, e)
 
-    def _check_ack(self, internal_key: str) -> bool:
+    def _has_ack(self, key: str) -> bool:
         """Check whether the receiver has sent an ACK for this key."""
-        ack_name = _shm_name(internal_key, suffix="_ack")
+        ack_name = self._ack_name(key)
         try:
-            data = self._shm_read(ack_name)
-            return data == _ACK_DONE
+            seg = shm_pkg.SharedMemory(name=ack_name)
+            try:
+                handle = {"name": ack_name, "size": seg.size}
+            finally:
+                seg.close()
+            shm_read_bytes(handle)
+            return True
         except Exception:
             return False
 
-    def _release_held_tensors(self, internal_key: str) -> None:
-        """Release held tensor references for a given key."""
+    def _drain_acks(self) -> None:
+        """Scan held tensors: release on ACK or TTL expiry."""
+        now = _time_mod.time()
+        to_release: list[str] = []
         with self._held_lock:
-            item = self._held_tensors.pop(internal_key, None)
-        if item:
-            self._metrics["ack_received"] += 1
-            logger.debug(f"Released {len(item[0])} held tensor refs for {internal_key}")
+            for key, (ts, _holders) in self._held_tensors.items():
+                if self._has_ack(key):
+                    to_release.append(key)
+                    self._metrics["acks"] += 1
+                elif now - ts > self.tensor_lifetime_sec:
+                    to_release.append(key)
+                    self._metrics["ack_timeouts"] += 1
+            for key in to_release:
+                self._held_tensors.pop(key, None)
 
-    # ------------------------------------------------------------------
-    # Background cleanup
-    # ------------------------------------------------------------------
-
-    def _cleanup_loop(self) -> None:
-        """Periodically check for ACKs and release tensor refs."""
-        while not self._stop_event.wait(timeout=1.0):
-            self._process_acks_and_ttl()
-
-    def _process_acks_and_ttl(self) -> None:
-        """Check ACKs and enforce TTL on held tensors."""
-        now = _time_mod.monotonic()
-        keys_to_release: list[str] = []
-        ttl_expired: list[str] = []
-
-        with self._held_lock:
-            for key, (refs, created_at) in list(self._held_tensors.items()):
-                if self._check_ack(key):
-                    keys_to_release.append(key)
-                elif now - created_at > self._tensor_lifetime_sec:
-                    ttl_expired.append(key)
-
-        for key in keys_to_release:
-            self._release_held_tensors(key)
-            # Clean up ACK SHM segment
-            self._shm_cleanup(_shm_name(key, suffix="_ack"))
-
-        for key in ttl_expired:
-            with self._held_lock:
-                item = self._held_tensors.pop(key, None)
-            if item:
-                self._metrics["ttl_expired"] += 1
-                logger.warning(
-                    f"TTL expired ({self._tensor_lifetime_sec}s): force-released "
-                    f"{len(item[0])} tensor refs for {key}"
-                )
-
-    # ------------------------------------------------------------------
-    # SHM helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _shm_write(name: str, data: bytes) -> None:
-        """Write bytes to a named POSIX shared memory segment."""
-        # Prepend 4-byte length header for reliable reading
-        payload = struct.pack("<I", len(data)) + data
-        try:
-            shm = shm_pkg.SharedMemory(name=name, create=True, size=len(payload))
-        except FileExistsError:
-            # Segment already exists; unlink and recreate
+    def _ack_loop(self) -> None:
+        """Background loop that periodically drains ACKs (~50 Hz)."""
+        while not self._stop_event.is_set():
             try:
-                old_shm = shm_pkg.SharedMemory(name=name, create=False)
-                old_shm.close()
-                old_shm.unlink()
-            except Exception:
-                pass
-            shm = shm_pkg.SharedMemory(name=name, create=True, size=len(payload))
-        try:
-            shm.buf[: len(payload)] = payload
-        finally:
-            shm.close()
-
-    @staticmethod
-    def _shm_read(name: str) -> bytes | None:
-        """Read bytes from a named POSIX shared memory segment."""
-        try:
-            shm = shm_pkg.SharedMemory(name=name, create=False)
-        except FileNotFoundError:
-            return None
-        try:
-            length = struct.unpack("<I", bytes(shm.buf[:4]))[0]
-            data = bytes(shm.buf[4 : 4 + length])
-            return data
-        finally:
-            shm.close()
-            try:
-                shm.unlink()
-            except Exception:
-                pass
-
-    @staticmethod
-    def _shm_cleanup(name: str) -> None:
-        """Best-effort removal of a SHM segment."""
-        try:
-            shm = shm_pkg.SharedMemory(name=name, create=False)
-            shm.close()
-            shm.unlink()
-        except Exception:
-            pass
+                self._drain_acks()
+            except Exception as e:
+                logger.debug("ACK loop error: %s", e)
+            self._stop_event.wait(timeout=0.02)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -431,45 +404,34 @@ class CudaIPCConnector(OmniConnectorBase):
 
     def cleanup(self, request_id: str) -> None:
         """Release resources for a specific request."""
-        # Try to release any held tensors matching this request_id prefix
-        keys_to_remove = []
         with self._held_lock:
-            for key in self._held_tensors:
-                if request_id in key:
-                    keys_to_remove.append(key)
-
-        for key in keys_to_remove:
-            self._release_held_tensors(key)
-            self._shm_cleanup(_shm_name(key))
-            self._shm_cleanup(_shm_name(key, suffix="_ack"))
+            self._held_tensors = {
+                k: v for k, v in self._held_tensors.items()
+                if not k.startswith(f"{request_id}_")
+            }
 
     def health(self) -> dict[str, Any]:
-        held_count = len(self._held_tensors)
         return {
             "status": "healthy" if not self._closed else "closed",
-            "role": self._role,
-            "held_tensor_groups": held_count,
+            "role": self.role,
+            "local_device": str(self.local_device),
+            "held_tensors": len(self._held_tensors),
             **self._metrics,
         }
 
     def close(self) -> None:
-        if getattr(self, "_closed", True):
+        if self._closed:
             return
         self._closed = True
         logger.info("Closing CudaIPCConnector...")
 
-        # Stop cleanup thread
         self._stop_event.set()
-        if self._cleanup_thread.is_alive():
-            self._cleanup_thread.join(timeout=2.0)
+        if self._ack_thread is not None and self._ack_thread.is_alive():
+            self._ack_thread.join(timeout=1.0)
 
-        # Release all held tensor refs
         with self._held_lock:
-            for key, (refs, _) in self._held_tensors.items():
-                logger.debug(f"Close: releasing {len(refs)} refs for {key}")
             self._held_tensors.clear()
 
-        # Collect CUDA IPC resources
         if torch.cuda.is_available():
             try:
                 torch.cuda.ipc_collect()
