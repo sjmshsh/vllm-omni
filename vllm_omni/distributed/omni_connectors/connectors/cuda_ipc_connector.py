@@ -10,6 +10,15 @@ Split-plane architecture:
   - Control Plane: IPC handles + small CPU data serialized via /dev/shm
     (< 1 KB per chunk), reusing the existing shm_write_bytes/shm_read_bytes
     utilities for consistency with SharedMemoryConnector.
+
+_CudaIpcMemHandle is a ctypes wrapper for the 64-byte opaque structure
+``cudaIpcMemHandle_t`` defined in ``cuda_runtime_api.h``.  It is the
+cross-process "ticket" that lets a receiver map the sender's GPU memory:
+
+  Sender:  cudaIpcGetMemHandle(ptr)  ->  64-byte handle  --(via SHM)-->
+  Receiver: cudaIpcOpenMemHandle(handle) -> mapped dev_ptr -> cudaMemcpy(D2D)
+
+We wrap it in ctypes so Python can pass it to/from the CUDA runtime C API.
 """
 
 import ctypes
@@ -34,9 +43,18 @@ logger = get_connector_logger(__name__)
 # Marker key embedded in serialized dicts to identify IPC tensor entries
 _GPU_TENSOR_MARKER = "__cuda_ipc_tensor__"
 
+# Default GPU memory budget for held tensors (bytes).
+# When exceeded, put() falls back to CPU serialization to avoid OOM.
+_DEFAULT_MAX_HELD_BYTES = 2 * 1024**3  # 2 GB
+
 
 class _CudaIpcMemHandle(ctypes.Structure):
-    """Wrapper for the 64-byte opaque CUDA IPC memory handle."""
+    """ctypes wrapper for ``cudaIpcMemHandle_t`` (64-byte opaque struct).
+
+    This is the cross-process "ticket" that lets a receiver map the sender's
+    GPU memory.  We need the ctypes struct so Python can correctly pass it
+    by reference to cudaIpcGetMemHandle / cudaIpcOpenMemHandle.
+    """
 
     _fields_ = [("reserved", ctypes.c_char * 64)]
 
@@ -51,6 +69,12 @@ class CudaIPCConnector(OmniConnectorBase):
 
     An ACK-based lifecycle ensures the sender holds tensor references until
     the receiver completes the D2D copy.
+
+    Memory backpressure:
+        ``max_held_bytes`` caps the total GPU memory pinned by un-ACK'd
+        tensors.  When the limit is reached, ``put()`` automatically falls
+        back to the CPU serialization path (same as SharedMemoryConnector),
+        trading latency for safety against OOM.
     """
 
     supports_gpu_tensor: bool = True
@@ -66,9 +90,14 @@ class CudaIPCConnector(OmniConnectorBase):
         self._closed = False
         self._cudart = None
 
-        # Sender state: held tensor references keyed by put_key
-        # Each entry: (created_at: float, holders: list[torch.Tensor])
-        self._held_tensors: dict[str, tuple[float, list[torch.Tensor]]] = {}
+        # --- Memory backpressure (Q7) ---
+        self._max_held_bytes = int(config.get("max_held_bytes", _DEFAULT_MAX_HELD_BYTES))
+        self._held_bytes = 0  # current total GPU bytes pinned by _held_tensors
+
+        # Sender state: held tensor references keyed by *composite key*
+        # (includes stage info to avoid SHM collisions — Q2).
+        # Each entry: (created_at, holders, total_nbytes)
+        self._held_tensors: dict[str, tuple[float, list[torch.Tensor], int]] = {}
         self._held_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._ack_thread: threading.Thread | None = None
@@ -81,6 +110,7 @@ class CudaIPCConnector(OmniConnectorBase):
             "acks": 0,
             "ack_timeouts": 0,
             "errors": 0,
+            "cpu_fallbacks": 0,
         }
 
         if not torch.cuda.is_available():
@@ -100,7 +130,8 @@ class CudaIPCConnector(OmniConnectorBase):
 
         logger.info(
             f"CudaIPCConnector initialized: role={self.role}, "
-            f"local_device={self.local_device}, tensor_lifetime={self.tensor_lifetime_sec}s"
+            f"local_device={self.local_device}, tensor_lifetime={self.tensor_lifetime_sec}s, "
+            f"max_held_bytes={self._max_held_bytes / 1024**2:.0f}MB"
         )
 
     # ------------------------------------------------------------------
@@ -125,11 +156,13 @@ class CudaIPCConnector(OmniConnectorBase):
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
         return f"{prefix}_{digest}"
 
-    def _payload_name(self, key: str) -> str:
-        return self._safe_name("cudaipc", key)
+    def _payload_name(self, composite_key: str) -> str:
+        """SHM name for the payload.  *composite_key* includes stage info (Q2)."""
+        return self._safe_name("cudaipc", composite_key)
 
-    def _ack_name(self, key: str) -> str:
-        return self._safe_name("cudaipc_ack", key)
+    def _ack_name(self, composite_key: str) -> str:
+        """SHM name for the ACK signal."""
+        return self._safe_name("cudaipc_ack", composite_key)
 
     def _lock_file(self, name: str) -> str:
         return f"/dev/shm/{name}.lock"
@@ -193,7 +226,14 @@ class CudaIPCConnector(OmniConnectorBase):
     # ------------------------------------------------------------------
 
     def _encode_gpu_tensor(self, tensor: torch.Tensor) -> tuple[dict[str, Any], torch.Tensor]:
-        """Encode a single CUDA tensor into an IPC metadata dict."""
+        """Encode a single CUDA tensor into an IPC metadata dict.
+
+        ``.contiguous()`` is required because IPC handles point to a single
+        contiguous allocation.  If the input is already contiguous the call
+        is a no-op (returns the same storage, no GPU copy).  The returned
+        *holder* tensor is stored in ``_held_tensors`` to keep the underlying
+        CUDA memory alive until the receiver ACKs.
+        """
         t = tensor.detach().contiguous()
         handle = self._get_ipc_handle(t.data_ptr())
         return {
@@ -261,29 +301,63 @@ class CudaIPCConnector(OmniConnectorBase):
         metadata.  The transformed structure is serialized via OmniSerializer
         and written to a shared memory segment.  Original GPU tensors are held
         alive in ``_held_tensors`` until the receiver ACKs.
+
+        If held GPU memory exceeds ``max_held_bytes``, the method
+        automatically falls back to full CPU serialization (same path as
+        SharedMemoryConnector) to avoid OOM.
         """
         if self._closed:
             return False, 0, None
 
+        # Build composite key that includes stage routing info (Q2:
+        # prevents SHM name collision when different stage pairs share
+        # the same put_key).
+        composite_key = f"{put_key}@{from_stage}_{to_stage}"
+
         try:
             # Opportunistically drain ACKs to release memory early
             self._drain_acks()
+
+            # --- Memory backpressure check (Q7) ---
+            if self._held_bytes >= self._max_held_bytes:
+                return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data)
 
             holders: list[torch.Tensor] = []
             encoded_obj = self._walk_encode(data, holders)
             payload = OmniSerializer.serialize(encoded_obj)
             size = len(payload)
 
-            payload_name = self._payload_name(put_key)
-            lock_file = self._lock_file(payload_name)
-            with open(lock_file, "wb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX)
-                meta = shm_write_bytes(payload, name=payload_name)
-                fcntl.flock(lockf, fcntl.LOCK_UN)
+            # Compute total GPU bytes for this batch of holders
+            batch_nbytes = sum(t.nbytes for t in holders)
 
+            # Re-check after encoding (encoding itself is fast, but another
+            # thread may have added entries between our check and here).
+            if holders and self._held_bytes + batch_nbytes > self._max_held_bytes:
+                return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data)
+
+            # --- Q1 fix: store holders BEFORE writing SHM ---
+            # This eliminates the window where the handle is visible to the
+            # receiver but the underlying tensor could theoretically be GC'd.
             if holders:
                 with self._held_lock:
-                    self._held_tensors[put_key] = (_time_mod.time(), holders)
+                    self._held_tensors[composite_key] = (_time_mod.time(), holders, batch_nbytes)
+                    self._held_bytes += batch_nbytes
+
+            payload_name = self._payload_name(composite_key)
+            lock_file = self._lock_file(payload_name)
+            try:
+                with open(lock_file, "wb+") as lockf:
+                    fcntl.flock(lockf, fcntl.LOCK_EX)
+                    meta = shm_write_bytes(payload, name=payload_name)
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
+            except Exception:
+                # SHM write failed — roll back the held tensors
+                if holders:
+                    with self._held_lock:
+                        popped = self._held_tensors.pop(composite_key, None)
+                        if popped:
+                            self._held_bytes -= popped[2]
+                raise
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
@@ -293,6 +367,44 @@ class CudaIPCConnector(OmniConnectorBase):
             self._metrics["errors"] += 1
             logger.error("CudaIPCConnector put failed for %s: %s", put_key, e, exc_info=True)
             return False, 0, None
+
+    def _put_cpu_fallback(
+        self,
+        from_stage: str,
+        to_stage: str,
+        put_key: str,
+        composite_key: str,
+        data: Any,
+    ) -> tuple[bool, int, dict[str, Any] | None]:
+        """Fallback: serialize everything to CPU and write to SHM.
+
+        Used when held GPU memory exceeds ``max_held_bytes`` to prevent OOM.
+        The receiver's ``_walk_decode`` will see no IPC markers and just
+        return the deserialized CPU tensors — no D2D copy needed.
+        """
+        logger.warning(
+            "CudaIPCConnector: held GPU memory (%.1f MB) >= limit (%.1f MB), "
+            "falling back to CPU serialization for %s",
+            self._held_bytes / 1024**2,
+            self._max_held_bytes / 1024**2,
+            put_key,
+        )
+        self._metrics["cpu_fallbacks"] += 1
+        # Use the base class serializer (same as SharedMemoryConnector):
+        # all tensors get .detach().cpu() inside OmniSerializer.
+        payload = self.serialize_obj(data)
+        size = len(payload)
+
+        payload_name = self._payload_name(composite_key)
+        lock_file = self._lock_file(payload_name)
+        with open(lock_file, "wb+") as lockf:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+            meta = shm_write_bytes(payload, name=payload_name)
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+
+        self._metrics["puts"] += 1
+        self._metrics["bytes_transferred"] += size
+        return True, size, {"shm": meta, "size": size, "cpu_fallback": True}
 
     # ------------------------------------------------------------------
     # get() — Receiver side
@@ -311,11 +423,17 @@ class CudaIPCConnector(OmniConnectorBase):
         tensors by opening IPC handles and performing D2D copies to the local
         GPU.  After all copies complete, sends an ACK via SHM so the sender
         can release its tensor references.
+
+        Transparently handles CPU-fallback payloads: if the data was serialized
+        by ``_put_cpu_fallback`` (no IPC markers), ``_walk_decode`` returns
+        the deserialized objects unchanged.
         """
         if self._closed:
             return None
 
-        payload_name = self._payload_name(get_key)
+        # Must match the composite_key format used in put() (Q2)
+        composite_key = f"{get_key}@{from_stage}_{to_stage}"
+        payload_name = self._payload_name(composite_key)
         lock_file = self._lock_file(payload_name)
         try:
             with open(lock_file, "rb+") as lockf:
@@ -334,7 +452,7 @@ class CudaIPCConnector(OmniConnectorBase):
             raw_obj = OmniSerializer.deserialize(data_bytes)
             obj = self._walk_decode(raw_obj)
             torch.cuda.synchronize(self.local_device)
-            self._send_ack(get_key)
+            self._send_ack(composite_key)
 
             size = len(data_bytes)
             self._metrics["gets"] += 1
@@ -352,17 +470,17 @@ class CudaIPCConnector(OmniConnectorBase):
     # ACK mechanism
     # ------------------------------------------------------------------
 
-    def _send_ack(self, key: str) -> None:
+    def _send_ack(self, composite_key: str) -> None:
         """Write an ACK to SHM to signal the sender that D2D copy is done."""
-        ack_name = self._ack_name(key)
+        ack_name = self._ack_name(composite_key)
         try:
             shm_write_bytes(b"1", name=ack_name)
         except Exception as e:
-            logger.debug("Failed to write ACK for %s: %s", key, e)
+            logger.debug("Failed to write ACK for %s: %s", composite_key, e)
 
-    def _has_ack(self, key: str) -> bool:
+    def _has_ack(self, composite_key: str) -> bool:
         """Check whether the receiver has sent an ACK for this key."""
-        ack_name = self._ack_name(key)
+        ack_name = self._ack_name(composite_key)
         try:
             seg = shm_pkg.SharedMemory(name=ack_name)
             try:
@@ -379,7 +497,7 @@ class CudaIPCConnector(OmniConnectorBase):
         now = _time_mod.time()
         to_release: list[str] = []
         with self._held_lock:
-            for key, (ts, _holders) in self._held_tensors.items():
+            for key, (ts, _holders, _nbytes) in self._held_tensors.items():
                 if self._has_ack(key):
                     to_release.append(key)
                     self._metrics["acks"] += 1
@@ -387,16 +505,24 @@ class CudaIPCConnector(OmniConnectorBase):
                     to_release.append(key)
                     self._metrics["ack_timeouts"] += 1
             for key in to_release:
-                self._held_tensors.pop(key, None)
+                popped = self._held_tensors.pop(key, None)
+                if popped:
+                    self._held_bytes -= popped[2]
 
     def _ack_loop(self) -> None:
-        """Background loop that periodically drains ACKs (~50 Hz)."""
+        """Background loop that periodically drains ACKs.
+
+        Interval: 100ms — aligned with the transfer adapter's recv_loop
+        back-off (Q3).  Combined with the synchronous ``_drain_acks()``
+        call at the top of every ``put()``, this gives ~10ms effective
+        latency for releasing held tensors under steady load.
+        """
         while not self._stop_event.is_set():
             try:
                 self._drain_acks()
             except Exception as e:
                 logger.debug("ACK loop error: %s", e)
-            self._stop_event.wait(timeout=0.02)
+            self._stop_event.wait(timeout=0.1)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -405,10 +531,14 @@ class CudaIPCConnector(OmniConnectorBase):
     def cleanup(self, request_id: str) -> None:
         """Release resources for a specific request."""
         with self._held_lock:
-            self._held_tensors = {
-                k: v for k, v in self._held_tensors.items()
-                if not k.startswith(f"{request_id}_")
-            }
+            keys_to_remove = [
+                k for k in self._held_tensors
+                if k.startswith(f"{request_id}_")
+            ]
+            for k in keys_to_remove:
+                popped = self._held_tensors.pop(k, None)
+                if popped:
+                    self._held_bytes -= popped[2]
 
     def health(self) -> dict[str, Any]:
         return {
@@ -416,6 +546,8 @@ class CudaIPCConnector(OmniConnectorBase):
             "role": self.role,
             "local_device": str(self.local_device),
             "held_tensors": len(self._held_tensors),
+            "held_bytes_mb": round(self._held_bytes / 1024**2, 1),
+            "max_held_bytes_mb": round(self._max_held_bytes / 1024**2, 1),
             **self._metrics,
         }
 
@@ -431,6 +563,7 @@ class CudaIPCConnector(OmniConnectorBase):
 
         with self._held_lock:
             self._held_tensors.clear()
+            self._held_bytes = 0
 
         if torch.cuda.is_available():
             try:

@@ -201,16 +201,19 @@ class TestCudaIPCConnectorSingleGPU:
             t = torch.randn(2, 3, device="cuda:0")
             success, _, _ = sender.put("0", "1", "test_ack", {"t": t})
             assert success
-            assert "test_ack" in sender._held_tensors
+            # Composite key includes stage info
+            composite_key = "test_ack@0_1"
+            assert composite_key in sender._held_tensors
 
             # Receiver gets (which sends ACK)
             result = receiver.get("0", "1", "test_ack")
             assert result is not None
 
-            # Wait for ACK drain loop (~20ms interval)
+            # Wait for ACK drain loop (~100ms interval)
             time.sleep(0.5)
 
-            assert "test_ack" not in sender._held_tensors
+            assert composite_key not in sender._held_tensors
+            assert sender._held_bytes == 0
         finally:
             sender.close()
             receiver.close()
@@ -222,15 +225,46 @@ class TestCudaIPCConnectorSingleGPU:
             t = torch.randn(2, 3, device="cuda:0")
             success, _, _ = sender.put("0", "1", "test_ttl", {"t": t})
             assert success
-            assert "test_ttl" in sender._held_tensors
+            composite_key = "test_ttl@0_1"
+            assert composite_key in sender._held_tensors
+            assert sender._held_bytes > 0
 
             # Wait for TTL to expire
             time.sleep(1.5)
 
-            assert "test_ttl" not in sender._held_tensors
+            assert composite_key not in sender._held_tensors
+            assert sender._held_bytes == 0
             assert sender._metrics["ack_timeouts"] > 0
         finally:
             sender.close()
+
+    def test_cpu_fallback_on_memory_pressure(self):
+        """When held GPU memory exceeds limit, put() should fallback to CPU serialization."""
+        # Set a very small limit so even a tiny tensor triggers fallback
+        sender = self._make_connector(role="sender", max_held_bytes=1)
+        receiver = self._make_connector(role="receiver")
+        try:
+            # First put a tensor that will be held
+            t1 = torch.randn(2, 3, device="cuda:0")
+            success1, _, meta1 = sender.put("0", "1", "key1", {"t": t1})
+            assert success1
+
+            # Second put should trigger CPU fallback
+            t2 = torch.randn(2, 3, device="cuda:0")
+            success2, _, meta2 = sender.put("0", "1", "key2", {"t": t2})
+            assert success2
+            assert meta2.get("cpu_fallback") is True
+            assert sender._metrics["cpu_fallbacks"] > 0
+
+            # Receiver should still be able to get the CPU-fallback data
+            result = receiver.get("0", "1", "key2")
+            assert result is not None
+            payload, _ = result
+            # CPU-fallback tensors are deserialized as CPU tensors
+            assert "t" in payload
+        finally:
+            sender.close()
+            receiver.close()
 
     def test_health(self):
         """health() should return expected fields."""
@@ -240,7 +274,10 @@ class TestCudaIPCConnectorSingleGPU:
             assert h["status"] == "healthy"
             assert h["role"] == "sender"
             assert "held_tensors" in h
+            assert "held_bytes_mb" in h
+            assert "max_held_bytes_mb" in h
             assert "puts" in h
+            assert "cpu_fallbacks" in h
         finally:
             connector.close()
 
