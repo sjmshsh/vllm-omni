@@ -96,9 +96,8 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "receiver")
             stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
-        elif from_stage == target_stage and target_stage == "0":
-            # Outgoing edge for stage 0 — included for async_chunk spec
-            # extraction (omni_stage.py), NOT for connector instantiation.
+        elif from_stage == target_stage:
+            # Outgoing edge: needed by async_chunk sender path on this stage.
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "sender")
             stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
@@ -331,15 +330,18 @@ def build_stage_connectors(
 
     connectors: dict[tuple[str, str], Any] = {}
     # Convert dictionary-formatted config to ConnectorSpec objects.
-    # Only instantiate INPUT connectors ("from_stage_X") — the stage worker
-    # only receives via connectors.  Output connectors are handled at the
-    # orchestrator level (try_send_via_connector uses orchestrator connectors).
+    # Instantiate both input and output connectors for stage workers; async_chunk
+    # may receive and send chunks in the same stage.
     stage_connector_specs = {}
     for key, config in connectors_config.items():
-        if not key.startswith("from_stage_"):
+        if key.startswith("from_stage_"):
+            from_stage = key.replace("from_stage_", "")
+            edge_key = (str(from_stage), str(stage_id))
+        elif key.startswith("to_stage_"):
+            to_stage = key.replace("to_stage_", "")
+            edge_key = (str(stage_id), str(to_stage))
+        else:
             continue
-
-        from_stage = key.replace("from_stage_", "")
         spec_dict = config.get("spec", {})
         if not spec_dict:
             continue
@@ -348,7 +350,7 @@ def build_stage_connectors(
             name=spec_dict.get("name", "SharedMemoryConnector"),
             extra=spec_dict.get("extra", {}),
         )
-        stage_connector_specs[(str(from_stage), str(stage_id))] = connector_spec
+        stage_connector_specs[edge_key] = connector_spec
 
     try:
         # Use unified connector creation logic

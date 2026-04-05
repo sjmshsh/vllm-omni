@@ -111,7 +111,9 @@ class OmniBase:
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:
             self.output_modalities = [
-                self.engine.get_stage_metadata(i).get("final_output_type") for i in range(self.engine.num_stages)
+                m
+                for i in range(self.engine.num_stages)
+                if (m := self.engine.get_stage_metadata(i).get("final_output_type"))
             ]
 
         self._stage_meta_list = [

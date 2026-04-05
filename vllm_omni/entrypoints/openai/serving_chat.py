@@ -275,6 +275,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request.modalities = (
             output_modalities if output_modalities is not None else self.engine_client.output_modalities
         )
+        # Use resolved modalities for generate(); local `output_modalities`
+        # can remain None when request field is omitted by client. Passing
+        # the unresolved local variable can cause text-only behavior even when
+        # server defaults include audio.
+        effective_output_modalities = request.modalities
 
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
@@ -392,7 +397,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     prompt=engine_prompt,
                     request_id=request_id,
                     sampling_params_list=sampling_params_list,
-                    output_modalities=output_modalities,
+                    output_modalities=effective_output_modalities,
                 )
 
                 generators.append(generator)

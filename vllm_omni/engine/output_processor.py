@@ -342,7 +342,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
-            if eco.pooling_output is not None and req_state.detokenizer is not None:
+            # code2wav/audio stages may not have detokenizer. If we gate this
+            # on detokenizer presence, audio pooling outputs are dropped and
+            # the client may only observe text chunks.
+            if eco.pooling_output is not None:
                 mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
                 req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
                 # Force text path in base processor for multimodal outputs.

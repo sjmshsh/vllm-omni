@@ -101,6 +101,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._held_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._ack_thread: threading.Thread | None = None
+        self._shm_compat_decode_failures: dict[str, int] = {}
 
         self._metrics = {
             "puts": 0,
@@ -115,7 +116,7 @@ class CudaIPCConnector(OmniConnectorBase):
 
         if not torch.cuda.is_available():
             raise RuntimeError("CudaIPCConnector requires CUDA runtime.")
-        self._cudart = torch.cuda.cudart()
+        self._cudart = self._load_cudart()
 
         # Validate P2P access (best-effort; may not have CUDA context yet)
         if torch.cuda.device_count() > 1:
@@ -123,9 +124,7 @@ class CudaIPCConnector(OmniConnectorBase):
 
         # Sender starts background ACK drain thread
         if self.role == "sender":
-            self._ack_thread = threading.Thread(
-                target=self._ack_loop, daemon=True, name="cuda-ipc-ack-loop"
-            )
+            self._ack_thread = threading.Thread(target=self._ack_loop, daemon=True, name="cuda-ipc-ack-loop")
             self._ack_thread.start()
 
         logger.info(
@@ -185,23 +184,81 @@ class CudaIPCConnector(OmniConnectorBase):
     # Low-level CUDA IPC via ctypes (stable across PyTorch versions)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _load_cudart():
+        """Load libcudart with IPC symbols and signatures."""
+        import ctypes.util
+        import glob
+
+        lib = None
+        name = ctypes.util.find_library("cudart")
+        if name:
+            try:
+                lib = ctypes.CDLL(name)
+                if not hasattr(lib, "cudaIpcGetMemHandle"):
+                    lib = None
+            except OSError:
+                lib = None
+
+        if lib is None:
+            candidates = sorted(
+                glob.glob("/usr/local/cuda*/lib*/libcudart.so*") + glob.glob("/opt/conda/lib/libcudart.so*"),
+                reverse=True,
+            )
+            for path in candidates:
+                try:
+                    lib = ctypes.CDLL(path)
+                    if hasattr(lib, "cudaIpcGetMemHandle"):
+                        break
+                    lib = None
+                except OSError:
+                    continue
+
+        if lib is None:
+            raise RuntimeError(
+                "Cannot find libcudart.so with cudaIpcGetMemHandle. "
+                "Ensure CUDA toolkit is installed and libcudart.so is on LD_LIBRARY_PATH."
+            )
+
+        lib.cudaIpcGetMemHandle.argtypes = [
+            ctypes.POINTER(_CudaIpcMemHandle),
+            ctypes.c_void_p,
+        ]
+        lib.cudaIpcGetMemHandle.restype = ctypes.c_int
+
+        lib.cudaIpcOpenMemHandle.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            _CudaIpcMemHandle,
+            ctypes.c_uint,
+        ]
+        lib.cudaIpcOpenMemHandle.restype = ctypes.c_int
+
+        lib.cudaIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
+        lib.cudaIpcCloseMemHandle.restype = ctypes.c_int
+
+        lib.cudaMemcpy.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        lib.cudaMemcpy.restype = ctypes.c_int
+        return lib
+
     def _get_ipc_handle(self, ptr: int) -> bytes:
         """Obtain a 64-byte CUDA IPC memory handle for a device pointer."""
         handle = _CudaIpcMemHandle()
         ret = self._cudart.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(ptr))
         if ret != 0:
             raise RuntimeError(f"cudaIpcGetMemHandle failed with code {ret}")
-        return bytes(handle.reserved)
+        return bytes(handle)
 
     def _open_ipc_ptr(self, handle_bytes: bytes) -> ctypes.c_void_p:
         """Open a CUDA IPC handle and return the mapped device pointer."""
-        handle = _CudaIpcMemHandle()
-        handle.reserved = handle_bytes
+        handle = _CudaIpcMemHandle.from_buffer_copy(handle_bytes)
         dev_ptr = ctypes.c_void_p()
         # 1 = cudaIpcMemLazyEnablePeerAccess
-        ret = self._cudart.cudaIpcOpenMemHandle(
-            ctypes.byref(dev_ptr), handle, ctypes.c_uint(1)
-        )
+        ret = self._cudart.cudaIpcOpenMemHandle(ctypes.byref(dev_ptr), handle, ctypes.c_uint(1))
         if ret != 0:
             raise RuntimeError(f"cudaIpcOpenMemHandle failed with code {ret}")
         return dev_ptr
@@ -215,9 +272,7 @@ class CudaIPCConnector(OmniConnectorBase):
     def _d2d_copy(self, dst_ptr: int, src_ptr: ctypes.c_void_p, nbytes: int) -> None:
         """Perform a D2D memcpy via cudart."""
         # cudaMemcpyDeviceToDevice = 3
-        ret = self._cudart.cudaMemcpy(
-            ctypes.c_void_p(dst_ptr), src_ptr, ctypes.c_size_t(nbytes), ctypes.c_int(3)
-        )
+        ret = self._cudart.cudaMemcpy(ctypes.c_void_p(dst_ptr), src_ptr, ctypes.c_size_t(nbytes), ctypes.c_int(3))
         if ret != 0:
             raise RuntimeError(f"cudaMemcpy(D2D) failed with code {ret}")
 
@@ -383,11 +438,11 @@ class CudaIPCConnector(OmniConnectorBase):
         return the deserialized CPU tensors — no D2D copy needed.
         """
         logger.warning(
-            "CudaIPCConnector: held GPU memory (%.1f MB) >= limit (%.1f MB), "
-            "falling back to CPU serialization for %s",
+            "CudaIPCConnector CPU fallback for %s: held GPU memory %.1f MB >= limit %.1f MB. "
+            "Consider reducing concurrency or increasing max_held_bytes.",
+            put_key,
             self._held_bytes / 1024**2,
             self._max_held_bytes / 1024**2,
-            put_key,
         )
         self._metrics["cpu_fallbacks"] += 1
         # Use the base class serializer (same as SharedMemoryConnector):
@@ -395,11 +450,11 @@ class CudaIPCConnector(OmniConnectorBase):
         payload = self.serialize_obj(data)
         size = len(payload)
 
-        payload_name = self._payload_name(composite_key)
-        lock_file = self._lock_file(payload_name)
+        # Use shared-memory compatible naming to allow cross-connector reads.
+        lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
         with open(lock_file, "wb+") as lockf:
             fcntl.flock(lockf, fcntl.LOCK_EX)
-            meta = shm_write_bytes(payload, name=payload_name)
+            meta = shm_write_bytes(payload, name=put_key)
             fcntl.flock(lockf, fcntl.LOCK_UN)
 
         self._metrics["puts"] += 1
@@ -435,6 +490,30 @@ class CudaIPCConnector(OmniConnectorBase):
         composite_key = f"{get_key}@{from_stage}_{to_stage}"
         payload_name = self._payload_name(composite_key)
         lock_file = self._lock_file(payload_name)
+        # Normal path: IPC payload exists.
+        # Fallback to shm_compat ONLY when IPC segment is absent (typically
+        # sender-side CPU fallback). This avoids hiding real IPC failures:
+        # if IPC segment exists but decode/open fails, we should surface error
+        # instead of silently downgrading to shm_compat.
+        ipc_exists = False
+        try:
+            seg = shm_pkg.SharedMemory(name=payload_name)
+            seg.close()
+            ipc_exists = True
+        except FileNotFoundError:
+            ipc_exists = False
+
+        if ipc_exists:
+            return self._try_get_ipc(get_key, composite_key, payload_name, lock_file)
+        return self._try_get_shm_compat(get_key)
+
+    def _try_get_ipc(
+        self,
+        get_key: str,
+        composite_key: str,
+        payload_name: str,
+        lock_file: str,
+    ) -> tuple[Any, int] | None:
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
@@ -458,12 +537,87 @@ class CudaIPCConnector(OmniConnectorBase):
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += size
             return obj, size
-
         except FileNotFoundError:
             return None
         except Exception as e:
             self._metrics["errors"] += 1
-            logger.error("CudaIPCConnector get failed for %s: %s", get_key, e, exc_info=True)
+            # Do not auto-fallback here: caller already knows IPC segment
+            # exists, so this is a real IPC path issue that should be visible.
+            logger.error("CudaIPCConnector IPC get failed for %s: %s", get_key, e, exc_info=True)
+            return None
+
+    def _try_get_shm_compat(self, get_key: str) -> tuple[Any, int] | None:
+        lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
+        try:
+            with open(lock_file, "rb+") as lockf:
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+                try:
+                    seg = shm_pkg.SharedMemory(name=get_key)
+                except FileNotFoundError:
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
+                    return None
+
+                try:
+                    mv = memoryview(seg.buf)
+                    data_bytes = bytes(mv[: seg.size])
+                    del mv
+                finally:
+                    try:
+                        seg.close()
+                    except Exception:
+                        pass
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
+
+            try:
+                obj = self.deserialize_obj(data_bytes)
+            except Exception as de:
+                n = self._shm_compat_decode_failures.get(get_key, 0) + 1
+                self._shm_compat_decode_failures[get_key] = n
+                logger.warning(
+                    "CudaIPCConnector shm_compat decode failed for %s: %s (attempt=%d, bytes=%d)",
+                    get_key,
+                    de,
+                    n,
+                    len(data_bytes),
+                )
+                # Keep SHM for retry; if repeatedly bad, drop it to avoid
+                # infinite poll loops on corrupted payloads.
+                if n >= 3:
+                    try:
+                        seg = shm_pkg.SharedMemory(name=get_key)
+                        try:
+                            seg.unlink()
+                        finally:
+                            seg.close()
+                    except Exception:
+                        pass
+                    try:
+                        if os.path.exists(lock_file):
+                            os.remove(lock_file)
+                    except OSError:
+                        pass
+                return None
+
+            self._shm_compat_decode_failures.pop(get_key, None)
+            try:
+                seg = shm_pkg.SharedMemory(name=get_key)
+                try:
+                    seg.unlink()
+                finally:
+                    seg.close()
+            except Exception:
+                pass
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+
+            size = len(data_bytes)
+            self._metrics["gets"] += 1
+            self._metrics["bytes_transferred"] += size
+            return obj, size
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            logger.warning("CudaIPCConnector shm_compat get failed for %s: %s", get_key, e)
             return None
 
     # ------------------------------------------------------------------
@@ -531,10 +685,7 @@ class CudaIPCConnector(OmniConnectorBase):
     def cleanup(self, request_id: str) -> None:
         """Release resources for a specific request."""
         with self._held_lock:
-            keys_to_remove = [
-                k for k in self._held_tensors
-                if k.startswith(f"{request_id}_")
-            ]
+            keys_to_remove = [k for k in self._held_tensors if k.startswith(f"{request_id}_")]
             for k in keys_to_remove:
                 popped = self._held_tensors.pop(k, None)
                 if popped:

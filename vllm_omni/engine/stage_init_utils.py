@@ -420,15 +420,57 @@ def get_stage_connector_spec(
     stage_id: int,
     async_chunk: bool,
 ) -> dict[str, Any]:
-    """Return the first connector spec for the stage when async chunking is enabled."""
+    """Return stage connector spec for async chunking.
+
+    Legacy format:
+        {"name": "...", "extra": {...}}
+
+    Dual format:
+        {
+            "input":  {"name": "...", "extra": {...}},
+            "output": {"name": "...", "extra": {...}},
+        }
+    """
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
 
     if not async_chunk:
         return {}
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
+    if not stage_connectors_cfg:
+        return {}
+
+    input_specs: list[tuple[int, dict[str, Any]]] = []
+    output_specs: list[tuple[int, dict[str, Any]]] = []
+    for key, cfg in stage_connectors_cfg.items():
+        spec = dict(cfg.get("spec", {}))
+        if not spec:
+            continue
+        if key.startswith("from_stage_"):
+            from_stage = key.replace("from_stage_", "")
+            order = int(from_stage) if from_stage.isdigit() else 10**9
+            input_specs.append((order, spec))
+        elif key.startswith("to_stage_"):
+            to_stage = key.replace("to_stage_", "")
+            order = int(to_stage) if to_stage.isdigit() else 10**9
+            output_specs.append((order, spec))
+
+    # Prefer dual connector shape when either direction exists.
+    if input_specs or output_specs:
+        result: dict[str, Any] = {}
+        if input_specs:
+            input_specs.sort(key=lambda x: x[0])
+            result["input"] = input_specs[0][1]
+        if output_specs:
+            output_specs.sort(key=lambda x: x[0])
+            result["output"] = output_specs[0][1]
+        return result
+
+    # Fallback to first available connector (legacy behavior).
     for cfg in stage_connectors_cfg.values():
-        return dict(cfg.get("spec", {}))
+        spec = dict(cfg.get("spec", {}))
+        if spec:
+            return spec
     return {}
 
 

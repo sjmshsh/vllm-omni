@@ -37,7 +37,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self.connector = self.create_connector(model_config)
+        input_conn, output_conn = self.create_connectors(model_config)
+        self.input_connector = input_conn
+        self.output_connector = output_conn
+        # Backward compatibility: `self.connector` may be used for shared attrs.
+        self.connector = self.input_connector or self.output_connector
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -59,8 +63,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
 
+    @property
+    def _transfer_stage_id(self) -> int:
+        cfg = getattr(self, "config", None)
+        sid = getattr(cfg, "stage_id", None) if cfg is not None else None
+        if sid is not None:
+            return int(sid)
+        return int(self.connector.stage_id)
+
     @classmethod
-    def create_connector(cls, model_config: Any):
+    def create_connectors(cls, model_config: Any):
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is None:
             connector_config = {}
@@ -70,11 +82,34 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "extra": getattr(connector_config, "extra", {}),
             }
 
-        connector_specs = ConnectorSpec(
+        if "input" in connector_config or "output" in connector_config:
+            input_conn = output_conn = None
+            for direction in ("input", "output"):
+                spec_dict = connector_config.get(direction)
+                if not spec_dict:
+                    continue
+                spec = ConnectorSpec(
+                    name=spec_dict.get("name", "SharedMemoryConnector"),
+                    extra=spec_dict.get("extra", {}),
+                )
+                conn = OmniConnectorFactory.create_connector(spec)
+                if direction == "input":
+                    input_conn = conn
+                else:
+                    output_conn = conn
+            return input_conn, output_conn
+
+        connector_spec = ConnectorSpec(
             name=connector_config.get("name", "SharedMemoryConnector"),
             extra=connector_config.get("extra", {}),
         )
-        return OmniConnectorFactory.create_connector(connector_specs)
+        conn = OmniConnectorFactory.create_connector(connector_spec)
+        return conn, conn
+
+    @classmethod
+    def create_connector(cls, model_config: Any):
+        input_conn, output_conn = cls.create_connectors(model_config)
+        return input_conn or output_conn
 
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
@@ -88,7 +123,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Args:
             request: The request object needing data.
         """
-        stage_id = self.connector.stage_id
+        stage_id = self._transfer_stage_id
 
         if stage_id == 0:
             return
@@ -123,7 +158,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._save_cond.notify()
 
     def _poll_single_request(self, request: Request):
-        stage_id = self.connector.stage_id
+        stage_id = self._transfer_stage_id
         target_stage_id = stage_id - 1
         req_id = request.request_id
         chunk_id = self.get_req_chunk[req_id]
@@ -132,13 +167,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         # Use timeout=0 for non-blocking poll
         try:
-            result = self.connector.get(
+            if self.input_connector is None:
+                return False
+            result = self.input_connector.get(
                 str(target_stage_id),
                 str(stage_id),
                 connector_get_key,
             )
         except Exception as e:
-            logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
+            logger.error(f"Connector get failed for req {connector_get_key}: {e}")
             return False
 
         if result is None:
@@ -208,7 +245,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         pooling_output = task["pooling_output"]
         request = task["request"]
         is_finished = task["is_finished"]
-        stage_id = self.connector.stage_id
+        stage_id = self._transfer_stage_id
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
@@ -230,7 +267,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not payload_data:
             return
 
-        success, size, metadata = self.connector.put(
+        if self.output_connector is None:
+            return
+        success, size, metadata = self.output_connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
@@ -313,7 +352,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         Process pending chunks for waiting and running queues.
         """
-        if self.connector.stage_id == 0:
+        if self._transfer_stage_id == 0:
             return
         self._process_chunk_queue(
             waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs

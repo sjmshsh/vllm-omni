@@ -118,12 +118,31 @@ class OmniEngineArgs(EngineArgs):
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 
-        # Build stage_connector_config from stage_connector_spec
-        stage_connector_config = {
-            "name": self.stage_connector_spec.get("name", "SharedMemoryConnector"),
-            "extra": self.stage_connector_spec.get("extra", {}).copy(),
-        }
-        stage_connector_config["extra"]["stage_id"] = self.stage_id
+        # Build stage_connector_config from stage_connector_spec.
+        # Support both legacy single-connector and dual input/output formats.
+        if "input" in self.stage_connector_spec or "output" in self.stage_connector_spec:
+            stage_connector_config: dict[str, Any] = {}
+            for direction in ("input", "output"):
+                spec = self.stage_connector_spec.get(direction)
+                if not isinstance(spec, dict) or not spec:
+                    continue
+                extra = spec.get("extra", {}).copy()
+                extra["stage_id"] = self.stage_id
+                stage_connector_config[direction] = {
+                    "name": spec.get("name", "SharedMemoryConnector"),
+                    "extra": extra,
+                }
+            if not stage_connector_config:
+                stage_connector_config = {
+                    "name": "SharedMemoryConnector",
+                    "extra": {"stage_id": self.stage_id},
+                }
+        else:
+            stage_connector_config = {
+                "name": self.stage_connector_spec.get("name", "SharedMemoryConnector"),
+                "extra": self.stage_connector_spec.get("extra", {}).copy(),
+            }
+            stage_connector_config["extra"]["stage_id"] = self.stage_id
 
         # If model_arch is specified, inject it into hf_overrides so vLLM can
         # resolve the architecture even when config.json lacks 'architectures'.
