@@ -103,9 +103,7 @@ def thinker2talker_async_chunk(
     """
 
     # Conditionally keep tensors on GPU when connector supports D2D transfer
-    _keep_on_gpu = getattr(
-        getattr(transfer_manager, "connector", None), "supports_gpu_tensor", False
-    )
+    _keep_on_gpu = getattr(getattr(transfer_manager, "connector", None), "supports_gpu_tensor", False)
     _to_out = (lambda t: t.detach()) if _keep_on_gpu else (lambda t: t.detach().cpu())
 
     request_id = request.external_req_id
