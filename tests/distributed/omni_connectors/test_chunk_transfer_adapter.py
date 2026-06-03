@@ -74,7 +74,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         monkeypatch.setattr(
             OmniChunkTransferAdapter,
             "create_connector",
-            classmethod(lambda cls, _model_config: connector),
+            classmethod(lambda cls, _model_config, _direction=None: connector),
         )
 
         model_config = SimpleNamespace(

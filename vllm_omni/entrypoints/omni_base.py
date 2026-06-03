@@ -195,7 +195,7 @@ class OmniBase(PDDisaggregationMixin):
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:
             self.output_modalities = [
-                m for i in range(self.engine.num_stages) if (m := self.engine.get_stage_metadata(i).final_output_type)
+                self.engine.get_stage_metadata(i).final_output_type for i in range(self.engine.num_stages)
             ]
 
         self._stage_meta_list = [self.engine.get_stage_metadata(i) for i in range(self.engine.num_stages)]

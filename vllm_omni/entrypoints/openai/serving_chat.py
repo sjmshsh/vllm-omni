@@ -369,11 +369,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         engine_output_modalities = [x for x in self.engine_client.output_modalities if x is not None]
         output_modalities = getattr(request, "modalities", engine_output_modalities)
         request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
-        # Use resolved modalities for generate(); local `output_modalities`
-        # can remain None when request field is omitted by client. Passing
-        # the unresolved local variable can cause text-only behavior even when
-        # server defaults include audio.
-        effective_output_modalities = request.modalities
 
         num_inference_steps = None
         cfg_text_scale = None
@@ -559,7 +554,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     prompt=engine_prompt,
                     request_id=request_id,
                     sampling_params_list=sampling_params_list,
-                    output_modalities=effective_output_modalities,
+                    output_modalities=output_modalities,
                 )
 
                 generators.append(generator)

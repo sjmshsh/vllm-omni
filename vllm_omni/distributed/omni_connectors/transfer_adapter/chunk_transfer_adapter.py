@@ -55,9 +55,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "race to evict it).",
                 self._active_window,
             )
-        input_conn, output_conn = self.create_connectors(model_config)
-        self.input_connector = input_conn
-        self.output_connector = output_conn
+        connector_config = self._connector_config(model_config)
+        if "input" in connector_config or "output" in connector_config:
+            self.input_connector = self.create_connector(model_config, "input")
+            self.output_connector = self.create_connector(model_config, "output")
+        else:
+            # Legacy single spec: share one instance across both directions.
+            self.input_connector = self.output_connector = self.create_connector(model_config)
         # Backward compatibility: `self.connector` may be used for shared attrs.
         self.connector = self.input_connector or self.output_connector
         super().__init__(model_config)
@@ -117,44 +121,52 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return int(self.connector.stage_id)
 
     @classmethod
-    def create_connectors(cls, model_config: Any):
+    def _connector_config(cls, model_config: Any) -> dict[str, Any]:
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is None:
-            connector_config = {}
-        elif not isinstance(connector_config, dict):
-            connector_config = {
+            return {}
+        if not isinstance(connector_config, dict):
+            return {
                 "name": getattr(connector_config, "name", None),
                 "extra": getattr(connector_config, "extra", {}),
             }
-
-        if "input" in connector_config or "output" in connector_config:
-            input_conn = output_conn = None
-            for direction in ("input", "output"):
-                spec_dict = connector_config.get(direction)
-                if not spec_dict:
-                    continue
-                spec = ConnectorSpec(
-                    name=spec_dict.get("name", "SharedMemoryConnector"),
-                    extra=spec_dict.get("extra", {}),
-                )
-                conn = OmniConnectorFactory.create_connector(spec)
-                if direction == "input":
-                    input_conn = conn
-                else:
-                    output_conn = conn
-            return input_conn, output_conn
-
-        connector_spec = ConnectorSpec(
-            name=connector_config.get("name", "SharedMemoryConnector"),
-            extra=connector_config.get("extra", {}),
-        )
-        conn = OmniConnectorFactory.create_connector(connector_spec)
-        return conn, conn
+        return connector_config
 
     @classmethod
-    def create_connector(cls, model_config: Any):
-        input_conn, output_conn = cls.create_connectors(model_config)
-        return input_conn or output_conn
+    def create_connector(cls, model_config: Any, direction: str | None = None):
+        """Build a single connector for this stage.
+
+        direction:
+            None              -> legacy single-connector spec (top-level
+                                 ``name``/``extra``).
+            "input"/"output"  -> dual-connector spec; returns ``None`` when
+                                 that direction is not configured.
+        """
+        connector_config = cls._connector_config(model_config)
+        if direction in ("input", "output"):
+            spec_dict = connector_config.get(direction)
+            if not spec_dict:
+                return None
+        else:
+            spec_dict = connector_config
+        spec = ConnectorSpec(
+            name=spec_dict.get("name", "SharedMemoryConnector"),
+            extra=spec_dict.get("extra", {}),
+        )
+        return OmniConnectorFactory.create_connector(spec)
+
+    def shutdown(self):
+        # Base shutdown() closes self.connector (== input_connector). In dual
+        # mode output_connector is a distinct instance whose close() is never
+        # otherwise invoked, leaking its background thread and GPU memory, so
+        # close it here too. The identity guard avoids a double-close when
+        # input/output share one instance (legacy single-connector mode).
+        super().shutdown()
+        if self.output_connector is not None and self.output_connector is not self.connector:
+            try:
+                self.output_connector.close()
+            except Exception:
+                pass
 
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
