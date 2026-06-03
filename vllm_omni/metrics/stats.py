@@ -5,11 +5,14 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
 from vllm_omni.metrics.utils import _build_field_defs, _build_row, _format_table
+
+if TYPE_CHECKING:
+    from vllm_omni.metrics.transfer import OmniTransferMetrics
 
 logger = init_logger(__name__)
 
@@ -36,11 +39,13 @@ class StageRequestStats:
     rx_in_flight_time_ms: float
     stage_stats: StageStats
     stage_id: int | None = None
+    replica_id: int | None = None
     final_output_type: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
     diffusion_metrics: dict[str, int] = None
     audio_generated_frames: int = 0
+    pipeline_timings: dict[str, float] | None = None
 
     @property
     def rx_mbps(self) -> float:
@@ -101,6 +106,7 @@ STAGE_EXCLUDE = {
     "rx_decode_time_ms",
     "rx_in_flight_time_ms",
     "final_output_type",
+    "pipeline_timings",
 }
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}
 E2E_EXCLUDE = {"request_id"}
@@ -119,6 +125,9 @@ class OrchestratorAggregator:
         log_stats: bool,
         wall_start_ts: float,
         final_stage_id_for_e2e: dict[str, int] | int,
+        *,
+        transfer_emitter: OmniTransferMetrics | None = None,
+        replica_resolver: Callable[[int, str], int | None] | None = None,
     ) -> None:
         self.num_stages = int(num_stages)
         self.log_stats = bool(log_stats)
@@ -129,6 +138,20 @@ class OrchestratorAggregator:
             tuple[int, int, str], TransferEdgeStats
         ] = {}  # Key: (from_stage, to_stage, request_id)
         self.e2e_events: list[RequestE2EStats] = []
+        # Emit per-physical-transfer Histogram observations to Prometheus
+        # alongside the existing TransferEdgeStats accumulation. Both deps
+        # are optional so OrchestratorAggregator stays usable in contexts
+        # that don't have a Prometheus registry (e.g. unit tests).
+        self._transfer_emitter = transfer_emitter
+        self._replica_resolver = replica_resolver
+        # Snapshot of (stage_id -> replica_id) per request, captured at
+        # ``record_transfer_rx`` time from the receiving stage's own
+        # ``StageRequestStats.replica_id``. Survives pool-side
+        # ``release_binding`` so the transfer emit can resolve label values
+        # even when the downstream stage's binding has already been released
+        # by the orchestrator's cleanup path (e.g. final-stage cleanup races
+        # the omni_base finalize emit).
+        self._replica_cache: dict[tuple[int, str], int] = {}
 
     def init_run_state(self, wall_start_ts: float) -> None:
         # Per-run aggregates and timing state
@@ -189,6 +212,14 @@ class OrchestratorAggregator:
             evt.size_bytes += int(size_bytes)
             evt.tx_time_ms += float(tx_time_ms)
             evt.used_shm = evt.used_shm or bool(used_shm)
+            # Emit per-physical-transfer Histogram observations to Prometheus.
+            self._emit_transfer_tx(
+                from_stage=int(from_stage),
+                to_stage=int(to_stage),
+                request_id=str(request_id),
+                size_bytes=int(size_bytes),
+                tx_time_ms=float(tx_time_ms),
+            )
             return evt
         except Exception:
             return None
@@ -203,6 +234,11 @@ class OrchestratorAggregator:
             from_stage = int(stats.stage_id) - 1
             to_stage = int(stats.stage_id)
             rid_key = str(stats.request_id)
+            # Snapshot the receiving (stage, replica) binding before the
+            # pool may release it on cleanup. Used by _resolve_edge_replicas
+            # as a fallback when get_bound_replica_id has already cleared.
+            if stats.replica_id is not None:
+                self._replica_cache[(to_stage, rid_key)] = int(stats.replica_id)
             evt = self._get_or_create_transfer_event(from_stage, to_stage, rid_key)
             # Accumulate rx metrics
             if evt.size_bytes == 0:
@@ -210,9 +246,78 @@ class OrchestratorAggregator:
                 evt.size_bytes = int(stats.rx_transfer_bytes)
             evt.rx_decode_time_ms += float(stats.rx_decode_time_ms)
             evt.in_flight_time_ms += float(stats.rx_in_flight_time_ms)
+            # Emit per-physical-receive Histogram observations to Prometheus.
+            self._emit_transfer_rx(
+                from_stage=from_stage,
+                to_stage=to_stage,
+                request_id=rid_key,
+                rx_decode_time_ms=float(stats.rx_decode_time_ms),
+                in_flight_time_ms=float(stats.rx_in_flight_time_ms),
+            )
             return evt
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # Prometheus emit hooks. Both helpers are no-ops when transfer_emitter
+    # or replica_resolver is None, or when the resolver cannot find a
+    # (stage_id, request_id) -> replica_id mapping. We deliberately
+    # fail-safe (skip) rather than emit a series with a wrong or invented
+    # replica label.
+    # ------------------------------------------------------------------
+
+    def _resolve_edge_replicas(self, from_stage: int, to_stage: int, request_id: str) -> tuple[int, int] | None:
+        # Prefer the per-request replica snapshot captured by
+        # record_transfer_rx (survives pool binding release); fall back to the
+        # resolver callback (pool.get_bound_replica_id) when the cache
+        # misses, e.g. for the TX side that fires before the receiving stage
+        # has recorded its stats.
+        from_r = self._replica_cache.get((from_stage, request_id))
+        to_r = self._replica_cache.get((to_stage, request_id))
+        if (from_r is None or to_r is None) and self._replica_resolver is not None:
+            if from_r is None:
+                from_r = self._replica_resolver(from_stage, request_id)
+            if to_r is None:
+                to_r = self._replica_resolver(to_stage, request_id)
+        if from_r is None or to_r is None:
+            return None
+        return int(from_r), int(to_r)
+
+    def _emit_transfer_tx(
+        self,
+        *,
+        from_stage: int,
+        to_stage: int,
+        request_id: str,
+        size_bytes: int,
+        tx_time_ms: float,
+    ) -> None:
+        if self._transfer_emitter is None:
+            return
+        replicas = self._resolve_edge_replicas(from_stage, to_stage, request_id)
+        if replicas is None:
+            return
+        from_r, to_r = replicas
+        self._transfer_emitter.observe_size(from_stage, from_r, to_stage, to_r, size_bytes)
+        self._transfer_emitter.observe_tx_time(from_stage, from_r, to_stage, to_r, tx_time_ms / 1000.0)
+
+    def _emit_transfer_rx(
+        self,
+        *,
+        from_stage: int,
+        to_stage: int,
+        request_id: str,
+        rx_decode_time_ms: float,
+        in_flight_time_ms: float,
+    ) -> None:
+        if self._transfer_emitter is None:
+            return
+        replicas = self._resolve_edge_replicas(from_stage, to_stage, request_id)
+        if replicas is None:
+            return
+        from_r, to_r = replicas
+        self._transfer_emitter.observe_rx_time(from_stage, from_r, to_stage, to_r, rx_decode_time_ms / 1000.0)
+        self._transfer_emitter.observe_in_flight_time(from_stage, from_r, to_stage, to_r, in_flight_time_ms / 1000.0)
 
     def record_audio_generated_frames(
         self,
@@ -460,6 +565,10 @@ class OrchestratorAggregator:
             ),
         )
         self.e2e_events.append(per_req_record)
+        # Drop per-request replica snapshots once the request is finalized.
+        if self._replica_cache:
+            for cached_key in [k for k in self._replica_cache if k[1] == rid_key]:
+                self._replica_cache.pop(cached_key, None)
 
     def build_and_log_summary(self) -> dict[str, Any]:
         if not self.log_stats:
@@ -487,6 +596,15 @@ class OrchestratorAggregator:
             "e2e_avg_time_per_request_ms": float(e2e_avg_req),
             "e2e_avg_tokens_per_s": float(e2e_avg_tok),
         }
+        # Add average input preprocess time across all requests
+        preprocess_times = []
+        for _rid, evts in self.stage_events.items():
+            for evt in evts:
+                if evt.pipeline_timings and "preprocess_ms" in evt.pipeline_timings:
+                    preprocess_times.append(evt.pipeline_timings["preprocess_ms"])
+                    break  # only once per request
+        if preprocess_times:
+            overall_summary["input_preprocess_time_ms"] = sum(preprocess_times) / len(preprocess_times)
         # Add stage_wall_time_ms as separate fields for each stage
         for idx, wall_time in enumerate(stage_wall_time_ms):
             overall_summary[f"e2e_stage_{idx}_wall_time_ms"] = wall_time
@@ -534,11 +652,41 @@ class OrchestratorAggregator:
                         ),
                     )
 
-            # === Stage table (columns = stage_id) ===
+            # === [OmniTiming] concise per-request summary ===
             stage_evts = sorted(
                 self.stage_events.get(rid, []),
                 key=lambda e: e.stage_id if e.stage_id is not None else -1,
             )
+            pt = {}
+            if stage_evts:
+                pt = stage_evts[-1].pipeline_timings or {}
+            if pt or e2e_evt:
+                parts = [f"req={rid}"]
+                if e2e_evt:
+                    parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
+                if "preprocess_ms" in pt:
+                    parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
+                if e2e_evt:
+                    engine_ms = e2e_evt.e2e_total_ms - pt.get("preprocess_ms", 0.0)
+                    parts.append(f"engine={engine_ms / 1000.0:.2f}s")
+                stage_parts = []
+                for evt in stage_evts:
+                    sid = evt.stage_id if evt.stage_id is not None else "?"
+                    t = evt.stage_gen_time_ms / 1000.0
+                    stage_parts.append(f"{sid}:{t:.2f}s")
+                if stage_parts:
+                    parts.append(f"stages=[{','.join(stage_parts)}]")
+                transfer_parts = []
+                for te in self.transfer_events.values():
+                    if te.request_id == rid:
+                        transfer_parts.append(f"{te.from_stage}->{te.to_stage}={te.tx_time_ms:.2f}ms")
+                if transfer_parts:
+                    parts.append(f"transfers=[{','.join(transfer_parts)}]")
+                if "ar2diffusion_ms" in pt:
+                    parts.append(f"ar2diffusion={pt['ar2diffusion_ms']:.2f}ms")
+                logger.info("[OmniTiming] %s", " ".join(parts))
+
+            # === Stage table (columns = stage_id) ===
             # if any stage has diffusion_metrics, remove postprocess_time_ms field
             # because it is already included in diffusion_metrics
             local_exclude = STAGE_EXCLUDE.copy()

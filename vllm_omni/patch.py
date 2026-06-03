@@ -1,7 +1,10 @@
+import logging
 import sys
+from functools import cached_property
 
 from aenum import extend_enum
-from vllm.inputs.data import TokensPrompt as _OriginalTokensPrompt
+from vllm.config import ModelConfig as _OriginalModelConfig
+from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
 )
@@ -10,12 +13,63 @@ from vllm.v1.engine import EngineCoreOutputs as _OriginalEngineCoreOutputs
 from vllm.v1.engine import EngineCoreRequest as _OriginalEngineCoreRequest
 from vllm.v1.request import Request as _OriginalRequest
 from vllm.v1.request import RequestStatus
+from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
 
 import vllm_omni.logger  # noqa: F401
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
-from vllm_omni.request import OmniRequest
+from vllm_omni.request import OmniRequest, OmniStreamingUpdate
+
+# =============================================================================
+# Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
+# =============================================================================
+# WHY: HunyuanImage-3.0 requires bidirectional attention for image tokens
+# (cond_token_attn_type: "joint_full" in config.json). vLLM gates this on
+# is_mm_prefix_lm, which checks an internal MM_PREFIX_LM_MODELS list that
+# does not include "hunyuan_image_3_moe" (the upstream HF model_type).
+#
+# WHY NOT model-level: is_mm_prefix_lm is checked in vLLM core (scheduler,
+# attention backend selection) before model code runs — no model-level hook.
+#
+# SCOPE: Only affects model_type in _OMNI_MM_PREFIX_LM_MODELS (currently
+# just "hunyuan_image_3_moe"). All other models fall through to the
+# original vLLM implementation unchanged.
+#
+# FRAGILITY: Relies on is_mm_prefix_lm being a cached_property on
+# ModelConfig. The __dict__ access + __set_name__ dance works around a
+# pydantic dataclass issue in vllm 0.19.0+. If vLLM changes
+# is_mm_prefix_lm to a regular method or removes it, this will break.
+#
+# TODO: Upstream a configurable MM_PREFIX_LM_MODELS or a model_config flag
+# so this patch can be removed.
+_OMNI_MM_PREFIX_LM_MODELS = ("hunyuan_image_3_moe",)
+# Access via __dict__ to avoid triggering cached_property.__get__ which fails
+# with "Cannot use cached_property instance without calling __set_name__" in
+# pydantic dataclasses (vllm 0.19.0+).
+_cp = _OriginalModelConfig.__dict__["is_mm_prefix_lm"]
+_original_is_mm_prefix_lm = _cp.func if hasattr(_cp, "func") else _cp.fget
+
+
+def _patched_is_mm_prefix_lm(self):
+    if _original_is_mm_prefix_lm(self):
+        return True
+    model_type = getattr(self.hf_config, "model_type", "")
+    return model_type in _OMNI_MM_PREFIX_LM_MODELS
+
+
+_patched_cp = cached_property(_patched_is_mm_prefix_lm)
+_patched_cp.__set_name__(_OriginalModelConfig, "is_mm_prefix_lm")
+_OriginalModelConfig.is_mm_prefix_lm = _patched_cp
+
+# Sanity check: verify the patch is active. If vLLM changes the descriptor
+# type or __set_name__ semantics, this will fail loudly at import time
+# rather than silently falling back to unpatched behavior.
+_installed = _OriginalModelConfig.__dict__.get("is_mm_prefix_lm")
+assert _installed is _patched_cp, (
+    "is_mm_prefix_lm patch failed to install — bidirectional attention "
+    "for HunyuanImage3 will not work. Check vLLM ModelConfig changes."
+)
 
 # =============================================================================
 # Patch GlmImageTextConfig to expose mrope_section in rope_parameters
@@ -49,7 +103,15 @@ if not hasattr(RequestStatus, "WAITING_FOR_CHUNK"):
     # as a non-finished state and remains compatible with existing comparisons.
     extend_enum(RequestStatus, "WAITING_FOR_CHUNK", -1)
 
-for module_name, module in sys.modules.items():
+if not hasattr(RequestStatus, "WAITING_FOR_INPUT"):
+    # Full-payload stage handoff uses a distinct waiting state so the
+    # scheduler can restore the request once non-stage-0 inputs arrive.
+    extend_enum(RequestStatus, "WAITING_FOR_INPUT", -2)
+
+# Snapshot sys.modules: `hasattr` below can trigger lazy submodule imports
+# (e.g. transformers' `_LazyModule.__getattr__`), which mutate sys.modules
+# during iteration and raise `dictionary changed size during iteration`.
+for module_name, module in list(sys.modules.items()):
     # only do patch on module of vllm, pass others
     if "vllm" not in module_name:
         continue
@@ -63,5 +125,66 @@ for module_name, module in sys.modules.items():
         module.MRotaryEmbedding = OmniMRotaryEmbedding
     if hasattr(module, "Request") and module.Request == _OriginalRequest:
         module.Request = OmniRequest
+    if hasattr(module, "StreamingUpdate") and module.StreamingUpdate == _OriginalStreamingUpdate:
+        module.StreamingUpdate = OmniStreamingUpdate
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
         module.EngineCoreRequest = OmniEngineCoreRequest
+
+# =============================================================================
+# Patch unregister_vllm_metrics to skip vllm:omni_* collectors
+# =============================================================================
+# WHY: Upstream unregister_vllm_metrics() uses `"vllm" in collector._name` to
+# strip collectors before each new PrometheusStatLogger registers, which is
+# how it avoids "Duplicated timeseries" when the same process spawns multiple
+# engines / orchestrators.  But its substring match also wipes our vllm:omni_*
+# families, so we must replace it with a scoped version that keeps ours.
+#
+# REMOVAL: Remove this patch once upstream vLLM adds
+# _STAT_LOGGER_METRIC_NAMES to vllm.v1.metrics.prometheus and scopes
+# unregister_vllm_metrics() to that set.  Track:
+# https://github.com/vllm-project/vllm/pull/42331
+import vllm.v1.metrics.prometheus as _vllm_prometheus  # noqa: E402
+
+_logger = logging.getLogger(__name__)
+
+
+def _scoped_unregister_vllm_metrics():
+    """Drop upstream vllm:* collectors but preserve vllm:omni_* (ours)."""
+    from prometheus_client import REGISTRY
+
+    for collector in list(REGISTRY._collector_to_names):
+        name = getattr(collector, "_name", "")
+        if "vllm" not in name:
+            continue
+        if name.startswith("vllm:omni_") or name.startswith("vllm_omni"):
+            continue
+        REGISTRY.unregister(collector)
+
+
+_vllm_prometheus.unregister_vllm_metrics = _scoped_unregister_vllm_metrics
+_logger.warning(
+    "Monkey-patched unregister_vllm_metrics() to scope drops to non-omni vllm:* collectors. "
+    "Remove this patch once vLLM adds _STAT_LOGGER_METRIC_NAMES."
+)
+
+
+# Patch: add qwen3_omni_moe to vllm's chat template fallback registry.
+# Qwen/Qwen3-Omni-30B-A3B-Instruct stores its chat_template in a standalone
+# chat_template.json (not in tokenizer_config.json).  transformers < 5.9.0
+# does not load this file, so the tokenizer has no chat_template attribute.
+# vllm's resolve_chat_template falls back to MODEL_TYPE_TO_CHAT_TEMPLATE
+# which has "qwen" but not "qwen3_omni_moe".  Register the same fallback.
+def _patch_chat_template_registry():
+    try:
+        from vllm.transformers_utils.chat_templates.registry import (
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK,
+            _get_qwen_chat_template_fallback,
+        )
+
+        if "qwen3_omni_moe" not in _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK:
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = _get_qwen_chat_template_fallback
+    except ImportError:
+        pass
+
+
+_patch_chat_template_registry()
