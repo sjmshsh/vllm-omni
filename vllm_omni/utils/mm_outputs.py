@@ -8,7 +8,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
+def build_mm_cpu(multimodal_outputs: dict, keep_on_gpu: bool = False) -> dict[str, object]:
     """Pre-copies multimodal tensor to CPU once (not per-request) to avoid
     redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
 
@@ -17,38 +17,38 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
 
     Args:
         multimodal_outputs: Multimodal dict mapping strings to objects.
+        keep_on_gpu: When True, detach tensors but keep them on GPU for
+            D2D transfer (e.g. via CudaIPCConnector).
     """
-    # Pre-copy multimodal tensors to CPU once (not per-request) to avoid
-    # redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
     mm_cpu: dict[str, object] = {}
-    # Currently there are some cases where this is true at the
-    # moment, which should be fixed.
     if not isinstance(multimodal_outputs, dict):
         logger.warning("Multimodal outputs are not a dict and will not be passed")
 
     if multimodal_outputs:
         for k, v in multimodal_outputs.items():
-            cpu_v = _to_cpu(v)
-            if cpu_v is not None:
-                mm_cpu[k] = cpu_v
+            converted = _detach_tensor(v, keep_on_gpu)
+            if converted is not None:
+                mm_cpu[k] = converted
     return mm_cpu
 
 
-def _to_cpu(value):
-    """Recursively detach + move tensors to CPU; preserve dict/list nesting."""
+def _detach_tensor(value, keep_on_gpu: bool = False):
+    """Recursively detach tensors; move to CPU unless keep_on_gpu is set."""
     if isinstance(value, torch.Tensor):
+        if keep_on_gpu:
+            return value.detach().clone()
         return value.detach().to("cpu").contiguous()
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            cpu_v = _to_cpu(v)
-            if cpu_v is not None:
-                out[k] = cpu_v
+            converted = _detach_tensor(v, keep_on_gpu)
+            if converted is not None:
+                out[k] = converted
         return out or None
     if isinstance(value, list):
         if not value:
             return value
-        return [_to_cpu(v) for v in value]
+        return [_detach_tensor(v, keep_on_gpu) for v in value]
     return value
 
 

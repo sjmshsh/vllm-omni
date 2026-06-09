@@ -98,7 +98,10 @@ class OmniConnectorModelRunnerMixin:
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
-        self._omni_connector: OmniConnectorBase | None = self._create_connector(model_config)
+        self._input_connector: OmniConnectorBase | None
+        self._output_connector: OmniConnectorBase | None
+        self._input_connector, self._output_connector = self._create_connectors(model_config)
+        self._omni_connector: OmniConnectorBase | None = self._input_connector or self._output_connector
         self._kv_transfer_manager = kv_transfer_manager
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
@@ -110,12 +113,16 @@ class OmniConnectorModelRunnerMixin:
 
         self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
+        _in_name = type(self._input_connector).__name__ if self._input_connector else None
+        _out_name = type(self._output_connector).__name__ if self._output_connector else None
         logger.info(
-            "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, connector=%s, func_path=%s",
+            "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, "
+            "input_connector=%s, output_connector=%s, func_path=%s",
             self._stage_id,
             self._async_chunk,
             self._custom_process_func,
-            type(self._omni_connector).__name__ if self._omni_connector else None,
+            _in_name,
+            _out_name,
             self._custom_process_func_path,
         )
 
@@ -196,7 +203,7 @@ class OmniConnectorModelRunnerMixin:
         # Start background threads only when there's a connector
         self._recv_thread: threading.Thread | None = None
         self._save_thread: threading.Thread | None = None
-        if self._omni_connector is not None:
+        if self._input_connector is not None or self._output_connector is not None:
             self._recv_thread = threading.Thread(
                 target=self._recv_loop,
                 daemon=True,
@@ -224,11 +231,12 @@ class OmniConnectorModelRunnerMixin:
             self._recv_thread.join(timeout=5)
         if self._save_thread is not None:
             self._save_thread.join(timeout=5)
-        if self._omni_connector is not None:
-            try:
-                self._omni_connector.close()
-            except Exception:
-                pass
+        for conn in (self._input_connector, self._output_connector):
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def cleanup_finished_request(self, req_id: str) -> None:
         """Clean up per-request state after a request is fully finished.
@@ -736,8 +744,8 @@ class OmniConnectorModelRunnerMixin:
         _custom_process_func, both of which are set at init time. Avoid
         the per-step dynamic import inside the model decode loop.
         """
-        if getattr(self, "_omni_connector", None) is None:
-            # No connector at all: send_full_payload_outputs would no-op.
+        if getattr(self, "_output_connector", None) is None:
+            # No output connector: send_full_payload_outputs would no-op.
             # Skip the per-step accumulator+build that would otherwise be
             # silently discarded.  Defends against a terminal stage whose
             # custom_process_input_func has a *_full_payload derivative in
@@ -949,8 +957,8 @@ class OmniConnectorModelRunnerMixin:
 
         Returns list of request IDs successfully enqueued.
         """
-        if self._omni_connector is None:
-            logger.info("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
+        if self._output_connector is None:
+            logger.info("[Stage-%s] send_full_payload_outputs: output_connector is None, skip", self._stage_id)
             return []
         if not self.is_data_transfer_rank():
             logger.info(
@@ -1120,8 +1128,8 @@ class OmniConnectorModelRunnerMixin:
         ``connector.put()`` is done by the background save thread.
         Non-KV data is identical across TP ranks; only rank 0 sends.
         """
-        if self._omni_connector is None:
-            logger.warning("[Stage-%s] send_chunk: connector is None", self._stage_id)
+        if self._output_connector is None:
+            logger.warning("[Stage-%s] send_chunk: output_connector is None", self._stage_id)
             return False
         if not self.is_data_transfer_rank():
             return True
@@ -1742,7 +1750,7 @@ class OmniConnectorModelRunnerMixin:
 
     def _poll_single_request(self, req_id: str) -> bool:
         """Poll connector for one chunk of a request (non-blocking)."""
-        connector = self._omni_connector
+        connector = self._input_connector
         if connector is None:
             return False
 
@@ -1954,7 +1962,7 @@ class OmniConnectorModelRunnerMixin:
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
         """
-        connector = self._omni_connector
+        connector = self._output_connector
         if connector is None:
             return True
 
@@ -2131,11 +2139,34 @@ class OmniConnectorModelRunnerMixin:
         return snapshot
 
     @staticmethod
-    def _create_connector(model_config: Any) -> OmniConnectorBase | None:
-        """Create a connector from model_config, or None if unconfigured."""
+    def _create_connector_from_spec(spec_dict: dict) -> OmniConnectorBase:
+        """Create a single connector from a {"name": ..., "extra": ...} dict."""
+        name = spec_dict.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise RuntimeError("Invalid stage connector config: missing connector name")
+        name = name.strip()
+        extra = spec_dict.get("extra")
+        if extra is None:
+            extra = {}
+        elif not isinstance(extra, dict):
+            raise RuntimeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
+        spec = ConnectorSpec(name=name, extra=extra)
+        try:
+            return OmniConnectorFactory.create_connector(spec)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to create connector {name}") from exc
+
+    @staticmethod
+    def _create_connectors(model_config: Any) -> tuple[OmniConnectorBase | None, OmniConnectorBase | None]:
+        """Create (input_connector, output_connector) from model_config.
+
+        Dual-connector format ``{"input": {...}, "output": {...}}`` produces
+        separate instances.  Legacy single format shares one instance for both.
+        Returns ``(None, None)`` when unconfigured.
+        """
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is None:
-            return None
+            return None, None
 
         if not isinstance(connector_config, dict):
             connector_config = {
@@ -2143,22 +2174,15 @@ class OmniConnectorModelRunnerMixin:
                 "extra": getattr(connector_config, "extra", None),
             }
 
-        name = connector_config.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise RuntimeError("Invalid stage connector config: missing connector name")
-        name = name.strip()
+        create = OmniConnectorModelRunnerMixin._create_connector_from_spec
 
-        extra = connector_config.get("extra")
-        if extra is None:
-            extra = {}
-        elif not isinstance(extra, dict):
-            raise RuntimeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
+        if "name" not in connector_config and ("input" in connector_config or "output" in connector_config):
+            inp = create(connector_config["input"]) if "input" in connector_config else None
+            out = create(connector_config["output"]) if "output" in connector_config else None
+            return inp, out
 
-        spec = ConnectorSpec(name=name, extra=extra)
-        try:
-            return OmniConnectorFactory.create_connector(spec)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to create connector {name}") from exc
+        conn = create(connector_config)
+        return conn, conn
 
     @staticmethod
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:

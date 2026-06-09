@@ -4,6 +4,7 @@
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -445,8 +446,16 @@ def thinker2talker_async_chunk(
     """
 
     # Conditionally keep tensors on GPU when connector supports D2D transfer
-    _keep_on_gpu = getattr(getattr(transfer_manager, "connector", None), "supports_gpu_tensor", False)
+    _connector = getattr(transfer_manager, "connector", None)
+    _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
     _to_out = (lambda t: t.detach()) if _keep_on_gpu else (lambda t: t.detach().cpu())
+    if os.environ.get("VLLM_CONNECTOR_PERF_DEBUG") == "1":
+        logger.info(
+            "thinker2talker_async_chunk: connector=%s supports_gpu=%s keep_on_gpu=%s",
+            type(_connector).__name__ if _connector else None,
+            getattr(_connector, "supports_gpu_tensor", "N/A"),
+            _keep_on_gpu,
+        )
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]

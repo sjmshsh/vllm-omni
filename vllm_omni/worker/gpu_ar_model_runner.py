@@ -103,6 +103,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._payload_keep_on_gpu: bool = getattr(
+            getattr(self, "_output_connector", None), "supports_gpu_tensor", False
+        )
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -677,7 +680,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             hidden_states_cpu = None
             if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
-                hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
+                _hs = hidden_states[:num_tokens_unpadded].detach()
+                hidden_states_cpu = _hs.clone() if self._payload_keep_on_gpu else _hs.to("cpu").contiguous()
 
             # Cache hidden states & multimodal outputs if we've enabled hidden state
             # prefix caching unless this isn't the last pipeline parallelism rank.
@@ -995,7 +999,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 int(hidden_states.shape[0]),
             )
             if len(downstream_req_ids) == len(req_ids_output_copy):
-                hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
+                _hs = hidden_states[:num_valid_tokens].detach()
+                hidden_states_cpu = _hs.clone() if self._payload_keep_on_gpu else _hs.to("cpu").contiguous()
             else:
                 req_hidden_states_cpu = {}
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
@@ -1038,7 +1043,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
             # Otherwise we don't have the mm CPU data yet, so we still need to build it
             if self.omni_prefix_cache is None or combined_multimodal_outputs is None:
-                mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs)
+                mm_cpu = build_mm_cpu(
+                    flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
+                    keep_on_gpu=self._payload_keep_on_gpu,
+                )
 
             self._process_additional_information_updates(
                 hidden_states,
@@ -1056,7 +1064,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
-                    req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
+                    _hs = hidden_states[start:end].detach()
+                    req_hidden_states_cpu[rid] = (
+                        _hs.clone() if self._payload_keep_on_gpu else _hs.to("cpu").contiguous()
+                    )
 
             pooler_output = []
             for out_idx, rid in enumerate(req_ids_output_copy):
