@@ -46,8 +46,6 @@ from ..utils.logging import get_connector_logger
 from ..utils.serialization import OmniSerializer
 from .base import OmniConnectorBase
 
-_PERF_DEBUG = os.environ.get("VLLM_CONNECTOR_PERF_DEBUG", "0") == "1"
-
 logger = get_connector_logger(__name__)
 
 _GPU_TENSOR_MARKER = "__cuda_ipc_tensor__"
@@ -527,15 +525,9 @@ class CudaIPCConnector(OmniConnectorBase):
         composite_key = f"{put_key}@{from_stage}_{to_stage}"
 
         try:
-            if _PERF_DEBUG:
-                logger.info("PERF put data_type=%s", type(data).__name__)
-
             slot_offset = self._acquire_credit()
             if slot_offset is None:
                 return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data)
-
-            if _PERF_DEBUG:
-                _t0 = _time_mod.monotonic()
 
             # Clear any stale release mark before handing the slot out.
             self._board.buf[slot_offset // self._slot_size] = 0
@@ -554,9 +546,6 @@ class CudaIPCConnector(OmniConnectorBase):
             # Data must be resident in the pool before metadata is published.
             self._sync_copy_stream()
 
-            if _PERF_DEBUG:
-                _t1 = _time_mod.monotonic()
-
             wrapped = {
                 _POOL_MARKER: True,
                 "pool_handle": self._pool_handle,
@@ -567,9 +556,6 @@ class CudaIPCConnector(OmniConnectorBase):
             }
             payload = OmniSerializer.serialize(wrapped)
             size = len(payload)
-
-            if _PERF_DEBUG:
-                _t2 = _time_mod.monotonic()
 
             # Track credit BEFORE writing SHM (same safety pattern as before)
             with self._held_lock:
@@ -587,22 +573,6 @@ class CudaIPCConnector(OmniConnectorBase):
                     self._held_credits.pop(composite_key, None)
                 self._credit_queue.put_nowait(slot_offset)
                 raise
-
-            if _PERF_DEBUG:
-                _t3 = _time_mod.monotonic()
-                logger.info(
-                    "PERF put %s→%s key=%s | slot=%d "
-                    "shm_payload=%dB | encode=%.3fms serialize=%.3fms shm_write=%.3fms total=%.3fms",
-                    from_stage,
-                    to_stage,
-                    put_key,
-                    slot_offset // self._slot_size,
-                    size,
-                    (_t1 - _t0) * 1000,
-                    (_t2 - _t1) * 1000,
-                    (_t3 - _t2) * 1000,
-                    (_t3 - _t0) * 1000,
-                )
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
@@ -678,9 +648,6 @@ class CudaIPCConnector(OmniConnectorBase):
         lock_file: str,
     ) -> tuple[Any, int] | None:
         try:
-            if _PERF_DEBUG:
-                _t0 = _time_mod.monotonic()
-
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
                 seg = shm_pkg.SharedMemory(name=payload_name)
@@ -694,13 +661,7 @@ class CudaIPCConnector(OmniConnectorBase):
             if os.path.exists(lock_file):
                 os.remove(lock_file)
 
-            if _PERF_DEBUG:
-                _t1 = _time_mod.monotonic()
-
             raw_obj = OmniSerializer.deserialize(data_bytes)
-
-            if _PERF_DEBUG:
-                _t2 = _time_mod.monotonic()
 
             # Pool-based or legacy per-tensor?
             board_name = None
@@ -719,9 +680,6 @@ class CudaIPCConnector(OmniConnectorBase):
             else:
                 obj = self._walk_decode_legacy(raw_obj)
 
-            if _PERF_DEBUG:
-                _t3 = _time_mod.monotonic()
-
             # Release the sender's pool slot: board write (fast path) or
             # legacy /dev/shm ACK file (old senders). Must happen only after
             # the copy-stream sync above — the sender may reuse the slot
@@ -734,21 +692,6 @@ class CudaIPCConnector(OmniConnectorBase):
             size = len(data_bytes)
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += size
-
-            if _PERF_DEBUG:
-                _t4 = _time_mod.monotonic()
-                logger.info(
-                    "PERF get key=%s | shm_payload=%dB | "
-                    "shm_read=%.3fms deserialize=%.3fms d2d_decode+sync=%.3fms ack=%.3fms total=%.3fms",
-                    get_key,
-                    size,
-                    (_t1 - _t0) * 1000,
-                    (_t2 - _t1) * 1000,
-                    (_t3 - _t2) * 1000,
-                    (_t4 - _t3) * 1000,
-                    (_t4 - _t0) * 1000,
-                )
-
             return obj, size
         except FileNotFoundError:
             return None

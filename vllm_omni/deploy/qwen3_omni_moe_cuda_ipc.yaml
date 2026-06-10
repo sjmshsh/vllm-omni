@@ -1,11 +1,13 @@
 # Qwen3-Omni-MoE deploy with CudaIPCConnector for ALL stage edges.
 #
 # Uses CudaIPCConnector for both cross-GPU (stage0→1, D2D via NVLink/PCIe)
-# and same-GPU (stage1→2, local D2D copy) transfers. This avoids the
-# dual-connector format mismatch where the mixin can only hold one connector.
+# and same-GPU (stage1→2, local D2D copy) transfers. Pool sizing: the
+# 512MB / 256-credit pool (2MB slots) absorbs talker→code2wav chunk bursts
+# at concurrency 4 with <0.1% CPU fallbacks; 2MB slots fit the first-chunk
+# prefill embeddings (~1.6MB at bf16 for a 200-token prompt).
 #
 # Usage:
-#   CUDA_VISIBLE_DEVICES=0,1 vllm serve <model-path> --omni \
+#   CUDA_VISIBLE_DEVICES=0,1 vllm-omni serve <model-path> --omni \
 #       --deploy-config vllm_omni/deploy/qwen3_omni_moe_cuda_ipc.yaml
 #
 async_chunk: true
@@ -15,7 +17,8 @@ connectors:
     name: CudaIPCConnector
     extra:
       tensor_lifetime_sec: 30.0
-      max_held_bytes: 2147483648
+      pool_size_mb: 512
+      pool_credits: 256
       codec_chunk_frames: 25
       codec_left_context_frames: 25
 
