@@ -18,6 +18,11 @@ try:
     from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
 except ImportError:
     MooncakeTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mooncake) not installed
+
+try:
+    from .connectors.mori_transfer_engine_connector import MoriTransferEngineConnector
+except ImportError:
+    MoriTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mori) not installed
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec, OmniTransferConfig
 from .utils.initialization import (
@@ -46,6 +51,7 @@ __all__ = [
     "MooncakeConnector",  # compat alias → MooncakeStoreConnector
     "MooncakeStoreConnector",
     "MooncakeTransferEngineConnector",
+    "MoriTransferEngineConnector",
     "SharedMemoryConnector",
     "YuanrongConnector",
     "YuanrongTransferEngineConnector",

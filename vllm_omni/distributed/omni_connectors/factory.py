@@ -125,6 +125,17 @@ def _create_cuda_ipc_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return CudaIPCConnector(config)
 
 
+def _create_mori_transfer_engine_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    try:
+        from .connectors.mori_transfer_engine_connector import MoriTransferEngineConnector
+    except ImportError:
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from omni_connectors.connectors.mori_transfer_engine_connector import MoriTransferEngineConnector
+    return MoriTransferEngineConnector(config)
+
+
 # Register connectors
 OmniConnectorFactory.register_connector("MooncakeStoreConnector", _create_mooncake_store_connector)
 OmniConnectorFactory.register_connector("MooncakeTransferEngineConnector", _create_mooncake_transfer_engine_connector)
@@ -132,5 +143,6 @@ OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_con
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
 OmniConnectorFactory.register_connector("CudaIPCConnector", _create_cuda_ipc_connector)
 OmniConnectorFactory.register_connector("YuanrongTransferEngineConnector", _create_yuanrong_transfer_engine_connector)
+OmniConnectorFactory.register_connector("MoriTransferEngineConnector", _create_mori_transfer_engine_connector)
 # Backward-compatible aliases – will be removed in the future
 OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_store_connector)
