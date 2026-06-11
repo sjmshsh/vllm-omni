@@ -472,7 +472,7 @@ def thinker2talker_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
 
-    def _maybe_cpu(t: Any) -> torch.Tensor | None:
+    def _to_out_or_none(t: Any) -> torch.Tensor | None:
         return _to_out(t) if isinstance(t, torch.Tensor) else None
 
     if chunk_id == 0:
@@ -481,9 +481,9 @@ def thinker2talker_async_chunk(
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
                 prefill=_to_out(thinker_emb),
-                tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
-                tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
-                tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
+                tts_bos=_to_out_or_none(thinker_embed.get("tts_bos")),
+                tts_eos=_to_out_or_none(thinker_embed.get("tts_eos")),
+                tts_pad=_to_out_or_none(thinker_embed.get("tts_pad")),
             ),
             hidden_states=HiddenStatesStruct(output=_to_out(thinker_hid)),
             ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
