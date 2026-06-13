@@ -2,6 +2,8 @@
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
 
+from collections.abc import Mapping
+
 import torch
 from vllm.logger import init_logger
 
@@ -21,7 +23,9 @@ def build_mm_cpu(multimodal_outputs: dict, keep_on_gpu: bool = False) -> dict[st
             D2D transfer (e.g. via CudaIPCConnector).
     """
     mm_cpu: dict[str, object] = {}
-    if not isinstance(multimodal_outputs, dict):
+    # Currently there are some cases where this is true at the
+    # moment, which should be fixed.
+    if not isinstance(multimodal_outputs, Mapping):
         logger.warning("Multimodal outputs are not a dict and will not be passed")
 
     if multimodal_outputs:
