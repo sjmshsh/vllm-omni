@@ -59,19 +59,23 @@ _POOL_MARKER = "__cuda_ipc_pool__"
 
 _POOL_ALIGNMENT = 16  # bytes, for GPU copy efficiency
 
+# Pool defaults: auto-sized when user omits pool_size_mb / pool_credits.
+# Auto formula: credits = max(64, max_num_seqs * 4), size = credits * 2 MB.
+# Explicit extra config values override auto-sizing.
 _DEFAULT_POOL_SIZE_MB = 128
 _DEFAULT_POOL_CREDITS = 64
 
+# CUDA runtime API constants (fixed by CUDA spec, not configurable).
 _CUDA_STREAM_NON_BLOCKING = 0x01  # cudaStreamNonBlocking
 _CUDA_EVENT_DISABLE_TIMING = 0x02  # cudaEventDisableTiming
 _CUDA_MEMCPY_D2D = 3  # cudaMemcpyDeviceToDevice
 
-# How long put() waits (reclaiming board credits inline) before CPU fallback.
-_CREDIT_WAIT_SEC = 0.008
-_CREDIT_POLL_SEC = 0.0002
-# Fast board-reclaim cadence; the TTL sweep runs every N fast ticks.
-_RELEASE_FAST_INTERVAL_SEC = 0.005
-_RELEASE_TTL_EVERY_N_TICKS = 20
+# Timing constants — overridable via extra config keys of the same name
+# (without leading underscore), e.g. ``"credit_wait_sec": 0.01``.
+_CREDIT_WAIT_SEC = 0.008  # put() inline reclaim window before CPU fallback
+_CREDIT_POLL_SEC = 0.0002  # poll interval within the reclaim window
+_RELEASE_FAST_INTERVAL_SEC = 0.005  # board-reclaim thread fast tick
+_RELEASE_TTL_EVERY_N_TICKS = 20  # TTL sweep runs every N fast ticks
 
 
 class _CudaIpcMemHandle(ctypes.Structure):
@@ -162,8 +166,22 @@ class CudaIPCConnector(OmniConnectorBase):
         self._cudart = self._load_cudart()
 
         # --- Memory pool (sender side) ---
-        pool_size_mb = int(config.get("pool_size_mb", _DEFAULT_POOL_SIZE_MB))
-        pool_credits = int(config.get("pool_credits", _DEFAULT_POOL_CREDITS))
+        # Auto-size from max_num_seqs when user omits explicit values.
+        max_num_seqs = int(config.get("max_num_seqs", 0))
+        if max_num_seqs > 0 and "pool_credits" not in config:
+            auto_credits = max(64, max_num_seqs * 4)
+            auto_size_mb = auto_credits * 2
+        else:
+            auto_credits = _DEFAULT_POOL_CREDITS
+            auto_size_mb = _DEFAULT_POOL_SIZE_MB
+        pool_size_mb = int(config.get("pool_size_mb", auto_size_mb))
+        pool_credits = int(config.get("pool_credits", auto_credits))
+
+        # Timing overrides via extra config.
+        self._credit_wait_sec = float(config.get("credit_wait_sec", _CREDIT_WAIT_SEC))
+        self._credit_poll_sec = float(config.get("credit_poll_sec", _CREDIT_POLL_SEC))
+        self._release_interval_sec = float(config.get("release_fast_interval_sec", _RELEASE_FAST_INTERVAL_SEC))
+        self._release_ttl_every = int(config.get("release_ttl_every_n_ticks", _RELEASE_TTL_EVERY_N_TICKS))
         self._pool_size = pool_size_mb * 1024 * 1024
         self._slot_size = self._pool_size // pool_credits
         self._pool_credits = pool_credits
@@ -765,20 +783,20 @@ class CudaIPCConnector(OmniConnectorBase):
     def _acquire_credit(self) -> int | None:
         """Get a free slot offset, reclaiming board credits inline.
 
-        Bounded wait (~_CREDIT_WAIT_SEC) before giving up; returns None to
+        Bounded wait (``credit_wait_sec``) before giving up; returns None to
         trigger the CPU fallback.
         """
         try:
             return self._credit_queue.get_nowait()
         except _queue_mod.Empty:
             pass
-        deadline = _time_mod.monotonic() + _CREDIT_WAIT_SEC
+        deadline = _time_mod.monotonic() + self._credit_wait_sec
         while _time_mod.monotonic() < deadline:
             self._reclaim_board_credits()
             try:
                 return self._credit_queue.get_nowait()
             except _queue_mod.Empty:
-                _time_mod.sleep(_CREDIT_POLL_SEC)
+                _time_mod.sleep(self._credit_poll_sec)
         return None
 
     def _release_expired_credits(self) -> None:
@@ -803,11 +821,11 @@ class CudaIPCConnector(OmniConnectorBase):
             try:
                 self._reclaim_board_credits()
                 tick += 1
-                if tick % _RELEASE_TTL_EVERY_N_TICKS == 0:
+                if tick % self._release_ttl_every == 0:
                     self._release_expired_credits()
             except Exception as e:
                 logger.debug("Release loop error: %s", e)
-            self._stop_event.wait(timeout=_RELEASE_FAST_INTERVAL_SEC)
+            self._stop_event.wait(timeout=self._release_interval_sec)
 
     # ------------------------------------------------------------------
     # Lifecycle

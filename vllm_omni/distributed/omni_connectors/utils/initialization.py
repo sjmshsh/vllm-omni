@@ -178,7 +178,9 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
             extra.setdefault("role", "receiver")
             stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
         elif from_stage == target_stage:
-            # Outgoing edge: needed by async_chunk sender path on this stage.
+            # Outgoing edge: this stage is the sender.  In dual-connector
+            # mode the stage worker instantiates a separate output connector
+            # from this spec.
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "sender")
             stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": extra}}

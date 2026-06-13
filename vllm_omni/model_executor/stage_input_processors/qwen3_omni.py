@@ -445,10 +445,8 @@ def thinker2talker_async_chunk(
     3. Package for talker with additional information
     """
 
-    # Conditionally keep tensors on GPU when connector supports D2D transfer
     _connector = getattr(transfer_manager, "connector", None)
     _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
-    _to_out = (lambda t: t.detach()) if _keep_on_gpu else (lambda t: t.detach().cpu())
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
@@ -473,20 +471,22 @@ def thinker2talker_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
 
-    def _to_out_or_none(t: Any) -> torch.Tensor | None:
-        return _to_out(t) if isinstance(t, torch.Tensor) else None
+    def _maybe_cpu(t: Any) -> torch.Tensor | None:
+        if not isinstance(t, torch.Tensor):
+            return None
+        return t.detach() if _keep_on_gpu else t.detach().cpu()
 
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)
         prompt_token_ids = _ensure_list(request.prompt_token_ids)
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
-                prefill=_to_out(thinker_emb),
-                tts_bos=_to_out_or_none(thinker_embed.get("tts_bos")),
-                tts_eos=_to_out_or_none(thinker_embed.get("tts_eos")),
-                tts_pad=_to_out_or_none(thinker_embed.get("tts_pad")),
+                prefill=_maybe_cpu(thinker_emb),
+                tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
+                tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
+                tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
             ),
-            hidden_states=HiddenStatesStruct(output=_to_out(thinker_hid)),
+            hidden_states=HiddenStatesStruct(output=_maybe_cpu(thinker_hid)),
             ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
             meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
             speaker=speaker,
@@ -526,7 +526,7 @@ def thinker2talker_async_chunk(
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
             meta=meta,
-            embed=EmbeddingsStruct(decode=_to_out(thinker_emb)),
+            embed=EmbeddingsStruct(decode=_maybe_cpu(thinker_emb)),
             speaker=speaker,
             language=language,
         )

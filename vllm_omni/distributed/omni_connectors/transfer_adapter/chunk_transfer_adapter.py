@@ -112,14 +112,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         num_placeholders = int(getattr(request, "num_output_placeholders", 0) or 0)
         return max(0, num_computed - num_placeholders)
 
-    @property
-    def _transfer_stage_id(self) -> int:
-        cfg = getattr(self, "config", None)
-        sid = getattr(cfg, "stage_id", None) if cfg is not None else None
-        if sid is not None:
-            return int(sid)
-        return int(self.connector.stage_id)
-
     @classmethod
     def _connector_config(cls, model_config: Any) -> dict[str, Any]:
         connector_config = getattr(model_config, "stage_connector_config", None)
@@ -155,19 +147,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         return OmniConnectorFactory.create_connector(spec)
 
-    def shutdown(self):
-        # Base shutdown() closes self.connector (== input_connector). In dual
-        # mode output_connector is a distinct instance whose close() is never
-        # otherwise invoked, leaking its background thread and GPU memory, so
-        # close it here too. The identity guard avoids a double-close when
-        # input/output share one instance (legacy single-connector mode).
-        super().shutdown()
-        if self.output_connector is not None and self.output_connector is not self.connector:
-            try:
-                self.output_connector.close()
-            except Exception:
-                pass
-
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
 
@@ -180,7 +159,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Args:
             request: The request object needing data.
         """
-        stage_id = self._transfer_stage_id
+        stage_id = int(self.connector.stage_id)
 
         if stage_id == 0:
             return
@@ -240,7 +219,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._save_cond.notify()
 
     def _poll_single_request(self, request: Request):
-        stage_id = self._transfer_stage_id
+        stage_id = int(self.connector.stage_id)
         target_stage_id = stage_id - 1
         req_id = request.request_id
         chunk_id = self.get_req_chunk[req_id]
@@ -346,7 +325,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
-        stage_id = self._transfer_stage_id
+        stage_id = int(self.connector.stage_id)
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
@@ -515,7 +494,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         callers that don't track aborts may omit it to keep the prior
         (unguarded) behaviour.
         """
-        if self._transfer_stage_id == 0:
+        if int(self.connector.stage_id) == 0:
             return
 
         # Purge deque entries whose request was freed mid-flight (abort →

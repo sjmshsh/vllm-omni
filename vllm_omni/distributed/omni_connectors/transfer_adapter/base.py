@@ -127,14 +127,18 @@ class OmniTransferAdapterBase:
         raise NotImplementedError
 
     def shutdown(self):
-        """Stop background loops and close the connector."""
+        """Stop background loops and close the connector(s)."""
         self.stop_event.set()
         with self._recv_cond:
             self._recv_cond.notify_all()
         with self._save_cond:
             self._save_cond.notify_all()
-        if self.connector is not None:
-            try:
-                self.connector.close()
-            except Exception:
-                pass
+        closed: set[int] = set()
+        for attr in ("connector", "output_connector"):
+            conn = getattr(self, attr, None)
+            if conn is not None and id(conn) not in closed:
+                closed.add(id(conn))
+                try:
+                    conn.close()
+                except Exception:
+                    pass

@@ -2139,24 +2139,6 @@ class OmniConnectorModelRunnerMixin:
         return snapshot
 
     @staticmethod
-    def _create_connector_from_spec(spec_dict: dict) -> OmniConnectorBase:
-        """Create a single connector from a {"name": ..., "extra": ...} dict."""
-        name = spec_dict.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise RuntimeError("Invalid stage connector config: missing connector name")
-        name = name.strip()
-        extra = spec_dict.get("extra")
-        if extra is None:
-            extra = {}
-        elif not isinstance(extra, dict):
-            raise RuntimeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
-        spec = ConnectorSpec(name=name, extra=extra)
-        try:
-            return OmniConnectorFactory.create_connector(spec)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to create connector {name}") from exc
-
-    @staticmethod
     def _create_connectors(model_config: Any) -> tuple[OmniConnectorBase | None, OmniConnectorBase | None]:
         """Create (input_connector, output_connector) from model_config.
 
@@ -2174,14 +2156,21 @@ class OmniConnectorModelRunnerMixin:
                 "extra": getattr(connector_config, "extra", None),
             }
 
-        create = OmniConnectorModelRunnerMixin._create_connector_from_spec
+        def _make(spec_dict: dict) -> OmniConnectorBase:
+            name = spec_dict.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise RuntimeError("Invalid stage connector config: missing connector name")
+            extra = spec_dict.get("extra") or {}
+            if not isinstance(extra, dict):
+                raise RuntimeError(f"Invalid extra config for connector {name}: expected dict")
+            return OmniConnectorFactory.create_connector(ConnectorSpec(name=name.strip(), extra=extra))
 
-        if "name" not in connector_config and ("input" in connector_config or "output" in connector_config):
-            inp = create(connector_config["input"]) if "input" in connector_config else None
-            out = create(connector_config["output"]) if "output" in connector_config else None
+        if "input" in connector_config or "output" in connector_config:
+            inp = _make(connector_config["input"]) if "input" in connector_config else None
+            out = _make(connector_config["output"]) if "output" in connector_config else None
             return inp, out
 
-        conn = create(connector_config)
+        conn = _make(connector_config)
         return conn, conn
 
     @staticmethod
