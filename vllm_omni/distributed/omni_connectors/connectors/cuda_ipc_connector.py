@@ -3,7 +3,7 @@
 
 """CUDA IPC Connector with pre-allocated memory pool for GPU-to-GPU transfer.
 
-Architecture (inspired by sglang-omni relay pattern):
+Architecture:
   - A fixed GPU memory pool is allocated once at init on the sender side.
     Its IPC handle is registered once — no per-tensor cudaIpcGetMemHandle.
   - Credit-based flow control: the pool is divided into N slots. Each put()
