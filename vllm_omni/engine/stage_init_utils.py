@@ -747,8 +747,12 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    if engine_args_dict.get("async_chunk", False):
-        engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
+    # Propagate the resolved connector spec to the stage worker for BOTH modes.
+    # full_payload (async_chunk=false) also uses self._output_connector in
+    # send_full_payload_outputs, so gating this on async_chunk silently dropped
+    # the configured connector (e.g. CudaIPC) and the worker fell back to the
+    # SharedMemoryConnector default.
+    engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
     if stage_type == "diffusion":
         from vllm_omni.diffusion.data import parse_attention_config
@@ -1127,9 +1131,11 @@ def get_stage_connector_spec(
     """
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
 
-    if not async_chunk:
-        return {}
-
+    # NOTE: do NOT early-return on ``not async_chunk``. full_payload mode
+    # (async_chunk=false) still uses ``self._output_connector`` in
+    # ``send_full_payload_outputs``, so it must honor the configured connector
+    # (e.g. CudaIPC) for the edge. The ``not stage_connectors_cfg`` guard below
+    # already preserves the SharedMemoryConnector default for unconfigured edges.
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     if not stage_connectors_cfg:
         return {}

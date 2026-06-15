@@ -384,6 +384,31 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "qwen3_omni_moe_cuda_ipc": {
+        "base_config": "qwen3_omni_moe_cuda_ipc.yaml",
+        "async_chunk": False,
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 5,
+                "max_model_len": 32768,
+                "mm_processor_cache_gb": 0,
+                "default_sampling_params": {"max_tokens": 150, "ignore_eos": False},
+            },
+            {
+                "stage_id": 1,
+                "max_num_seqs": 5,
+                "gpu_memory_utilization": 0.5,
+                "max_model_len": 32768,
+                "default_sampling_params": {"max_tokens": 1000},
+            },
+            {
+                "stage_id": 2,
+                "max_num_seqs": 5,
+                "default_sampling_params": {"max_tokens": 2000},
+            },
+        ],
+    },
     "qwen3_omni_moe_multi_replicas_4gpu": {
         "base_config": "qwen3_omni_moe.yaml",
         "async_chunk": True,

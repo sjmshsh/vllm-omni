@@ -13,14 +13,14 @@ Architecture:
   - Control plane: tensor layout metadata serialized via /dev/shm, same as
     before (< 1 KB per chunk).
 
-Latency-isolation design (avoids stalling concurrent CUDA-graph replays):
-  - All pool copies run as cudaMemcpyAsync on a private non-blocking stream.
-    A cudaEvent recorded on the legacy default stream orders the pack copies
-    after in-flight producer kernels WITHOUT inserting a barrier that would
-    block subsequently launched compute kernels (which a synchronous
-    cudaMemcpy on the legacy stream does).
-  - The receiver synchronizes only its private copy stream per get() instead
-    of a device-wide torch synchronize that waits for unrelated work.
+CUDA-graph compatibility:
+  - Both sender and receiver use dedicated non-blocking copy streams
+    for D2D transfers, keeping each side's compute/default stream free
+    for forward-pass kernels and CUDA-graph replay.
+  - Sender: records compute-stream event → copy_stream waits on it →
+    .copy_() on copy_stream → records IPC event (no CPU synchronize).
+  - Receiver: opens sender's IPC event (cached) → cudaStreamWaitEvent
+    on current_stream → cudaMemcpyAsync from pool → stream synchronize.
   - Credit release uses a shared-memory "release board" (1 byte per slot):
     the receiver flips the slot byte after its copies complete; the sender
     reclaims credits by reading the board — plain memory reads, no per-key
@@ -33,8 +33,8 @@ which the receiver reads through the same key-based lookup. Transfers
 never block on pool capacity.
 """
 
+import collections
 import ctypes
-import fcntl
 import hashlib
 import os
 import queue as _queue_mod
@@ -46,7 +46,7 @@ from typing import Any
 
 import torch
 
-from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
+from vllm_omni.entrypoints.stage_utils import shm_write_bytes
 
 from ..utils.logging import get_connector_logger
 from ..utils.serialization import OmniSerializer
@@ -66,15 +66,13 @@ _DEFAULT_POOL_SIZE_MB = 128
 _DEFAULT_POOL_CREDITS = 64
 
 # CUDA runtime API constants (fixed by CUDA spec, not configurable).
-_CUDA_STREAM_NON_BLOCKING = 0x01  # cudaStreamNonBlocking
-_CUDA_EVENT_DISABLE_TIMING = 0x02  # cudaEventDisableTiming
 _CUDA_MEMCPY_D2D = 3  # cudaMemcpyDeviceToDevice
 
 # Timing constants — overridable via extra config keys of the same name
 # (without leading underscore), e.g. ``"credit_wait_sec": 0.01``.
-_CREDIT_WAIT_SEC = 0.008  # put() inline reclaim window before CPU fallback
-_CREDIT_POLL_SEC = 0.0002  # poll interval within the reclaim window
-_RELEASE_FAST_INTERVAL_SEC = 0.005  # board-reclaim thread fast tick
+_CREDIT_WAIT_SEC = 0.05  # put() inline reclaim window before CPU fallback
+_CREDIT_POLL_SEC = 0.0005  # poll interval within the reclaim window
+_RELEASE_FAST_INTERVAL_SEC = 0.001  # board-reclaim thread fast tick
 _RELEASE_TTL_EVERY_N_TICKS = 20  # TTL sweep runs every N fast ticks
 
 
@@ -84,6 +82,16 @@ class _CudaIpcMemHandle(ctypes.Structure):
     _fields_ = [("reserved", ctypes.c_char * 64)]
 
 
+class _CudaIpcEventHandle(ctypes.Structure):
+    """ctypes wrapper for ``cudaIpcEventHandle_t`` (64-byte opaque struct)."""
+
+    _fields_ = [("reserved", ctypes.c_char * 64)]
+
+
+_CUDA_EVENT_INTERPROCESS = 0x04
+_CUDA_EVENT_DISABLE_TIMING = 0x02
+
+
 class _SlotOverflowError(Exception):
     """Raised when tensors exceed a pool slot's capacity."""
 
@@ -91,34 +99,23 @@ class _SlotOverflowError(Exception):
 class _PoolSlot:
     """Tracks packing state for tensors within a single pool credit slot."""
 
-    __slots__ = ("_pool_data_ptr", "_base", "_size", "_cursor", "_cudart", "_stream")
+    __slots__ = ("_pool", "_base", "_size", "_cursor")
 
-    def __init__(self, pool_data_ptr: int, slot_offset: int, slot_size: int, cudart, stream: ctypes.c_void_p):
-        self._pool_data_ptr = pool_data_ptr
+    def __init__(self, pool: torch.Tensor, slot_offset: int, slot_size: int):
+        self._pool = pool
         self._base = slot_offset
         self._size = slot_size
         self._cursor = 0
-        self._cudart = cudart
-        self._stream = stream
 
     def pack(self, tensor: torch.Tensor) -> int:
-        """Enqueue an async D2D copy into the pool slot, return byte offset within slot.
-
-        Copies run on the connector's private stream; the caller must
-        synchronize that stream before publishing the slot metadata.
-        """
+        """Copy tensor into the pool slot via PyTorch .copy_(), return byte offset."""
         nbytes = tensor.nbytes
         padding = (-self._cursor) % _POOL_ALIGNMENT
         aligned = self._cursor + padding
         if aligned + nbytes > self._size:
             raise _SlotOverflowError()
-        dst = ctypes.c_void_p(self._pool_data_ptr + self._base + aligned)
-        src = ctypes.c_void_p(tensor.data_ptr())
-        ret = self._cudart.cudaMemcpyAsync(
-            dst, src, ctypes.c_size_t(nbytes), ctypes.c_int(_CUDA_MEMCPY_D2D), self._stream
-        )
-        if ret != 0:
-            raise RuntimeError(f"cudaMemcpyAsync (pool pack) failed with code {ret}")
+        src_bytes = tensor.view(torch.uint8).reshape(-1)
+        self._pool[self._base + aligned : self._base + aligned + nbytes].copy_(src_bytes)
         self._cursor = aligned + nbytes
         return aligned
 
@@ -186,24 +183,27 @@ class CudaIPCConnector(OmniConnectorBase):
         self._slot_size = self._pool_size // pool_credits
         self._pool_credits = pool_credits
 
-        # Private non-blocking stream for all pool copies: keeps the legacy
-        # default stream free so concurrent CUDA-graph replays never stall
-        # behind connector memcpys (and vice versa).
-        with torch.cuda.device(self.local_device):
-            self._copy_stream = self._create_stream()
-
         if self.role == "sender":
             with torch.cuda.device(self.local_device):
                 self._pool = torch.zeros(self._pool_size, dtype=torch.uint8, device=self.local_device)
-                # Orders pack copies after in-flight producer kernels.
-                self._order_event = self._create_event()
+                self._copy_stream = torch.cuda.Stream(device=self.local_device)
+                self._compute_event = torch.cuda.Event()
+                self._copy_done_event = torch.cuda.Event()
             self._pool_handle = self._get_ipc_handle(self._pool.data_ptr())
+            self._ipc_event = ctypes.c_void_p()
+            flags = ctypes.c_uint(_CUDA_EVENT_INTERPROCESS | _CUDA_EVENT_DISABLE_TIMING)
+            ret = self._cudart.cudaEventCreateWithFlags(ctypes.byref(self._ipc_event), flags)
+            if ret != 0:
+                raise RuntimeError(f"cudaEventCreateWithFlags failed: {ret}")
+            ipc_evt_handle = _CudaIpcEventHandle()
+            ret = self._cudart.cudaIpcGetEventHandle(ctypes.byref(ipc_evt_handle), self._ipc_event)
+            if ret != 0:
+                raise RuntimeError(f"cudaIpcGetEventHandle failed: {ret}")
+            self._ipc_event_handle_bytes = bytes(ipc_evt_handle)
             self._credit_queue: _queue_mod.Queue[int] = _queue_mod.Queue(maxsize=pool_credits)
             for i in range(pool_credits):
                 self._credit_queue.put_nowait(i * self._slot_size)
-            # Track which credit is held for which composite_key: key -> (timestamp, slot_offset)
             self._held_credits: dict[str, tuple[float, int]] = {}
-            # Release board: 1 byte per slot, receiver writes 1 when done.
             self._board_name = f"cudaipc_board_{uuid.uuid4().hex[:16]}"
             self._board = shm_pkg.SharedMemory(create=True, size=pool_credits, name=self._board_name)
             self._board.buf[:pool_credits] = bytes(pool_credits)
@@ -212,13 +212,21 @@ class CudaIPCConnector(OmniConnectorBase):
             self._pool_handle = None
             self._credit_queue = None
             self._held_credits = {}
-            self._order_event = None
             self._board_name = None
             self._board = None
+            _NUM_RECV_STREAMS = 8
+            with torch.cuda.device(self.local_device):
+                self._recv_copy_streams = [
+                    torch.cuda.Stream(device=self.local_device) for _ in range(_NUM_RECV_STREAMS)
+                ]
+                self._recv_copy_events = [torch.cuda.Event() for _ in range(_NUM_RECV_STREAMS)]
+            self._recv_stream_idx = 0
+            self._deferred_credit_releases: collections.deque = collections.deque()
 
-        # Receiver: cache opened pool IPC mappings / sender release boards
+        # Receiver: cache opened pool IPC mappings / sender release boards / IPC events
         self._opened_pools: dict[bytes, ctypes.c_void_p] = {}
         self._opened_boards: dict[str, shm_pkg.SharedMemory] = {}
+        self._opened_events: dict[bytes, ctypes.c_void_p] = {}
 
         if torch.accelerator.device_count() > 1:
             self._validate_p2p_access()
@@ -232,7 +240,8 @@ class CudaIPCConnector(OmniConnectorBase):
         logger.info(
             f"CudaIPCConnector initialized: role={self.role}, "
             f"local_device={self.local_device}, "
-            f"pool={pool_size_mb}MB ({pool_credits} credits × {self._slot_size // 1024 // 1024}MB slots)"
+            f"pool={pool_size_mb}MB ({pool_credits} credits × {self._slot_size // 1024 // 1024}MB slots), "
+            f"config_keys={sorted(config.keys())}"
         )
 
     # ------------------------------------------------------------------
@@ -260,8 +269,20 @@ class CudaIPCConnector(OmniConnectorBase):
     def _payload_name(self, composite_key: str) -> str:
         return self._safe_name("cudaipc", composite_key)
 
-    def _lock_file(self, name: str) -> str:
-        return f"/dev/shm/{name}.lock"
+    @staticmethod
+    def _atomic_shm_write(payload: bytes, name: str) -> dict[str, Any]:
+        """Write to SHM atomically: write to temp name, then rename."""
+        from multiprocessing.resource_tracker import unregister
+
+        tmp_name = f"{name}__tmp"
+        meta = shm_write_bytes(payload, name=tmp_name)
+        os.rename(f"/dev/shm/{tmp_name}", f"/dev/shm/{name}")
+        try:
+            unregister(f"/{tmp_name}", "shared_memory")
+        except KeyError:
+            pass
+        meta["name"] = name
+        return meta
 
     def _validate_p2p_access(self) -> None:
         n_devices = torch.accelerator.device_count()
@@ -341,21 +362,24 @@ class CudaIPCConnector(OmniConnectorBase):
         ]
         lib.cudaMemcpyAsync.restype = ctypes.c_int
 
-        lib.cudaStreamCreateWithFlags.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
-        lib.cudaStreamCreateWithFlags.restype = ctypes.c_int
-        lib.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
-        lib.cudaStreamSynchronize.restype = ctypes.c_int
-        lib.cudaStreamDestroy.argtypes = [ctypes.c_void_p]
-        lib.cudaStreamDestroy.restype = ctypes.c_int
-
         lib.cudaEventCreateWithFlags.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
         lib.cudaEventCreateWithFlags.restype = ctypes.c_int
+
+        lib.cudaIpcGetEventHandle.argtypes = [ctypes.POINTER(_CudaIpcEventHandle), ctypes.c_void_p]
+        lib.cudaIpcGetEventHandle.restype = ctypes.c_int
+
+        lib.cudaIpcOpenEventHandle.argtypes = [ctypes.POINTER(ctypes.c_void_p), _CudaIpcEventHandle]
+        lib.cudaIpcOpenEventHandle.restype = ctypes.c_int
+
         lib.cudaEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         lib.cudaEventRecord.restype = ctypes.c_int
+
         lib.cudaStreamWaitEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
         lib.cudaStreamWaitEvent.restype = ctypes.c_int
+
         lib.cudaEventDestroy.argtypes = [ctypes.c_void_p]
         lib.cudaEventDestroy.restype = ctypes.c_int
+
         return lib
 
     def _get_ipc_handle(self, ptr: int) -> bytes:
@@ -386,39 +410,16 @@ class CudaIPCConnector(OmniConnectorBase):
             self._opened_pools[pool_handle] = self._open_ipc_ptr(pool_handle)
         return self._opened_pools[pool_handle]
 
-    def _create_stream(self) -> ctypes.c_void_p:
-        stream = ctypes.c_void_p()
-        ret = self._cudart.cudaStreamCreateWithFlags(ctypes.byref(stream), ctypes.c_uint(_CUDA_STREAM_NON_BLOCKING))
-        if ret != 0:
-            raise RuntimeError(f"cudaStreamCreateWithFlags failed with code {ret}")
-        return stream
-
-    def _create_event(self) -> ctypes.c_void_p:
-        event = ctypes.c_void_p()
-        ret = self._cudart.cudaEventCreateWithFlags(ctypes.byref(event), ctypes.c_uint(_CUDA_EVENT_DISABLE_TIMING))
-        if ret != 0:
-            raise RuntimeError(f"cudaEventCreateWithFlags failed with code {ret}")
-        return event
-
-    def _sync_copy_stream(self) -> None:
-        ret = self._cudart.cudaStreamSynchronize(self._copy_stream)
-        if ret != 0:
-            raise RuntimeError(f"cudaStreamSynchronize failed with code {ret}")
-
-    def _wait_producer_kernels(self) -> None:
-        """Make the copy stream wait for in-flight kernels on the legacy stream.
-
-        cudaEventRecord on the NULL (legacy) stream completes after all prior
-        work submitted to blocking streams; cudaStreamWaitEvent then orders
-        our async pack copies after that point without blocking any compute
-        stream the way a synchronous legacy-stream cudaMemcpy would.
-        """
-        ret = self._cudart.cudaEventRecord(self._order_event, None)
-        if ret != 0:
-            raise RuntimeError(f"cudaEventRecord failed with code {ret}")
-        ret = self._cudart.cudaStreamWaitEvent(self._copy_stream, self._order_event, ctypes.c_uint(0))
-        if ret != 0:
-            raise RuntimeError(f"cudaStreamWaitEvent failed with code {ret}")
+    def _open_ipc_event(self, handle_bytes: bytes) -> ctypes.c_void_p:
+        """Open a CUDA IPC event handle (cached — only opened once per sender)."""
+        if handle_bytes not in self._opened_events:
+            handle = _CudaIpcEventHandle.from_buffer_copy(handle_bytes)
+            event = ctypes.c_void_p()
+            ret = self._cudart.cudaIpcOpenEventHandle(ctypes.byref(event), handle)
+            if ret != 0:
+                raise RuntimeError(f"cudaIpcOpenEventHandle failed: {ret}")
+            self._opened_events[handle_bytes] = event
+        return self._opened_events[handle_bytes]
 
     # ------------------------------------------------------------------
     # Pool-based encode / decode
@@ -452,36 +453,59 @@ class CudaIPCConnector(OmniConnectorBase):
             }
         return obj
 
-    def _decode_pool_tensor(self, meta: dict[str, Any], pool_ptr: ctypes.c_void_p, slot_offset: int) -> torch.Tensor:
-        """Decode a tensor from a cached pool mapping (async on copy stream)."""
+    def _decode_pool_tensor(
+        self,
+        meta: dict[str, Any],
+        pool_ptr: ctypes.c_void_p,
+        slot_offset: int,
+        stream: torch.cuda.Stream | None = None,
+    ) -> torch.Tensor:
+        """Decode a tensor from a cached pool mapping on *stream*.
+
+        If *stream* is None, falls back to the current (compute) stream for
+        backward compatibility.
+        """
         shape = tuple(meta["shape"])
         dtype = getattr(torch, meta["dtype"])
         nbytes = int(meta["nbytes"])
         tensor_offset = int(meta["pool_offset"])
         dst = torch.empty(shape, dtype=dtype, device=self.local_device)
         src = ctypes.c_void_p(pool_ptr.value + slot_offset + tensor_offset)
+        target_stream = stream if stream is not None else torch.cuda.current_stream(self.local_device)
+        # dst was allocated on the compute stream but is written on
+        # target_stream (recv copy-stream). Tell the caching allocator dst is
+        # in use on target_stream so the block is not reaped/reused while the
+        # async D2D is still in flight on that stream.
+        if stream is not None:
+            dst.record_stream(target_stream)
         ret = self._cudart.cudaMemcpyAsync(
             ctypes.c_void_p(dst.data_ptr()),
             src,
             ctypes.c_size_t(nbytes),
             ctypes.c_int(_CUDA_MEMCPY_D2D),
-            self._copy_stream,
+            ctypes.c_void_p(target_stream.cuda_stream),
         )
         if ret != 0:
             raise RuntimeError(f"cudaMemcpyAsync (pool decode) failed with code {ret}")
         self._metrics["gpu_tensors_transferred"] += 1
         return dst
 
-    def _walk_decode_pool(self, obj: Any, pool_ptr: ctypes.c_void_p, slot_offset: int) -> Any:
+    def _walk_decode_pool(
+        self,
+        obj: Any,
+        pool_ptr: ctypes.c_void_p,
+        slot_offset: int,
+        stream: torch.cuda.Stream | None = None,
+    ) -> Any:
         """Recursively restore tensors from pool offset metadata."""
         if isinstance(obj, dict) and obj.get(_GPU_TENSOR_MARKER):
-            return self._decode_pool_tensor(obj, pool_ptr, slot_offset)
+            return self._decode_pool_tensor(obj, pool_ptr, slot_offset, stream=stream)
         if isinstance(obj, dict):
-            return {k: self._walk_decode_pool(v, pool_ptr, slot_offset) for k, v in obj.items()}
+            return {k: self._walk_decode_pool(v, pool_ptr, slot_offset, stream=stream) for k, v in obj.items()}
         if isinstance(obj, list):
-            return [self._walk_decode_pool(v, pool_ptr, slot_offset) for v in obj]
+            return [self._walk_decode_pool(v, pool_ptr, slot_offset, stream=stream) for v in obj]
         if isinstance(obj, tuple):
-            return tuple(self._walk_decode_pool(v, pool_ptr, slot_offset) for v in obj)
+            return tuple(self._walk_decode_pool(v, pool_ptr, slot_offset, stream=stream) for v in obj)
         return obj
 
     # ------------------------------------------------------------------
@@ -501,29 +525,37 @@ class CudaIPCConnector(OmniConnectorBase):
         composite_key = f"{put_key}@{from_stage}_{to_stage}"
 
         try:
+            _t0 = _time_mod.perf_counter()
             slot_offset = self._acquire_credit()
+            _t_credit = _time_mod.perf_counter()
             if slot_offset is None:
                 return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data)
 
             credit_returned = False
             try:
-                # Clear any stale release mark before handing the slot out.
                 self._board.buf[slot_offset // self._slot_size] = 0
 
-                # Order async pack copies after in-flight producer kernels.
-                self._wait_producer_kernels()
-
-                slot = _PoolSlot(self._pool.data_ptr(), slot_offset, self._slot_size, self._cudart, self._copy_stream)
+                slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
+                self._compute_event.record()
+                self._copy_stream.wait_event(self._compute_event)
                 try:
-                    encoded_obj = self._walk_encode_pool(data, slot)
+                    with torch.cuda.stream(self._copy_stream):
+                        encoded_obj = self._walk_encode_pool(data, slot)
                 except _SlotOverflowError:
-                    self._sync_copy_stream()  # drain partial enqueued copies
+                    self._copy_done_event.record(self._copy_stream)
+                    self._copy_done_event.synchronize()
                     credit_returned = True
                     self._credit_queue.put_nowait(slot_offset)
                     return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data)
 
-                # Data must be resident in the pool before metadata is published.
-                self._sync_copy_stream()
+                _t_copy = _time_mod.perf_counter()
+                ret = self._cudart.cudaEventRecord(
+                    self._ipc_event,
+                    ctypes.c_void_p(self._copy_stream.cuda_stream),
+                )
+                if ret != 0:
+                    logger.warning("cudaEventRecord (IPC) failed: %d", ret)
+                _t_sync = _time_mod.perf_counter()
 
                 wrapped = {
                     _POOL_MARKER: True,
@@ -531,33 +563,45 @@ class CudaIPCConnector(OmniConnectorBase):
                     "slot_offset": slot_offset,
                     "board": self._board_name,
                     "slot_index": slot_offset // self._slot_size,
+                    "event_handle": self._ipc_event_handle_bytes,
                     "payload": encoded_obj,
                 }
                 payload = OmniSerializer.serialize(wrapped)
                 size = len(payload)
+                _t_set = _time_mod.perf_counter()
             except Exception:
-                # The slot is not yet tracked in _held_credits — without this
-                # the credit would leak permanently on an unexpected failure.
                 if not credit_returned:
                     self._credit_queue.put_nowait(slot_offset)
                 raise
 
-            # Track credit BEFORE writing SHM (same safety pattern as before)
             with self._held_lock:
                 self._held_credits[composite_key] = (_time_mod.time(), slot_offset)
 
             payload_name = self._payload_name(composite_key)
-            lock_file = self._lock_file(payload_name)
             try:
-                with open(lock_file, "wb+") as lockf:
-                    fcntl.flock(lockf, fcntl.LOCK_EX)
-                    meta = shm_write_bytes(payload, name=payload_name)
-                    fcntl.flock(lockf, fcntl.LOCK_UN)
+                meta = self._atomic_shm_write(payload, name=payload_name)
             except Exception:
                 with self._held_lock:
                     self._held_credits.pop(composite_key, None)
                 self._credit_queue.put_nowait(slot_offset)
                 raise
+            _t_shm = _time_mod.perf_counter()
+
+            put_n = self._metrics["puts"]
+            if put_n < 20 or put_n % 200 == 0:
+                logger.info(
+                    "IPC_PUT #%d key=%s credit=%.3fms copy=%.3fms sync=%.3fms "
+                    "ser=%.3fms shm=%.3fms total=%.3fms size=%d",
+                    put_n,
+                    put_key,
+                    (_t_credit - _t0) * 1000,
+                    (_t_copy - _t_credit) * 1000,
+                    (_t_sync - _t_copy) * 1000,
+                    (_t_set - _t_sync) * 1000,
+                    (_t_shm - _t_set) * 1000,
+                    (_t_shm - _t0) * 1000,
+                    size,
+                )
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
@@ -584,11 +628,7 @@ class CudaIPCConnector(OmniConnectorBase):
         payload = self.serialize_obj(data)
         size = len(payload)
 
-        lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
-        with open(lock_file, "wb+") as lockf:
-            fcntl.flock(lockf, fcntl.LOCK_EX)
-            meta = shm_write_bytes(payload, name=put_key)
-            fcntl.flock(lockf, fcntl.LOCK_UN)
+        meta = self._atomic_shm_write(payload, name=put_key)
 
         self._metrics["puts"] += 1
         self._metrics["bytes_transferred"] += size
@@ -610,58 +650,119 @@ class CudaIPCConnector(OmniConnectorBase):
 
         composite_key = f"{get_key}@{from_stage}_{to_stage}"
         payload_name = self._payload_name(composite_key)
-        lock_file = self._lock_file(payload_name)
-        ipc_exists = False
-        try:
-            seg = shm_pkg.SharedMemory(name=payload_name)
-            seg.close()
-            ipc_exists = True
-        except FileNotFoundError:
-            ipc_exists = False
-        except ValueError:
-            return None
-
-        if ipc_exists:
-            return self._try_get_ipc(get_key, payload_name, lock_file)
+        if os.path.exists(f"/dev/shm/{payload_name}"):
+            return self._try_get_ipc(get_key, payload_name)
         return self._try_get_shm_compat(get_key)
+
+    def _flush_deferred_releases(self) -> None:
+        """Release credits for completed D2D copies (non-blocking)."""
+        still_pending: list[tuple] = []
+        while self._deferred_credit_releases:
+            event, board, slot_index = self._deferred_credit_releases.popleft()
+            if event.query():
+                self._mark_board_release(board, slot_index)
+            else:
+                still_pending.append((event, board, slot_index))
+        if still_pending:
+            self._deferred_credit_releases.extend(still_pending)
 
     def _try_get_ipc(
         self,
         get_key: str,
         payload_name: str,
-        lock_file: str,
     ) -> tuple[Any, int] | None:
         try:
-            with open(lock_file, "rb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX)
-                seg = shm_pkg.SharedMemory(name=payload_name)
-                try:
-                    shm_handle = {"name": payload_name, "size": seg.size}
-                finally:
-                    seg.close()
-                data_bytes = shm_read_bytes(shm_handle)
-                fcntl.flock(lockf, fcntl.LOCK_UN)
-
-            if os.path.exists(lock_file):
-                os.remove(lock_file)
+            _t0 = _time_mod.perf_counter()
+            seg = shm_pkg.SharedMemory(name=payload_name)
+            try:
+                data_bytes = bytes(seg.buf[: seg.size])
+            finally:
+                seg.close()
+                seg.unlink()
+            _t_shm = _time_mod.perf_counter()
 
             raw_obj = OmniSerializer.deserialize(data_bytes)
+            _t_deser = _time_mod.perf_counter()
             if not isinstance(raw_obj, dict) or not raw_obj.get(_POOL_MARKER):
                 logger.error("CudaIPCConnector get: unexpected payload format for %s (corrupt segment?)", get_key)
                 return None
 
             pool_ptr = self._open_pool(raw_obj["pool_handle"])
-            obj = self._walk_decode_pool(raw_obj["payload"], pool_ptr, raw_obj["slot_offset"])
-            # Wait only for our own copies — never for unrelated device
-            # work (e.g. in-flight CUDA-graph replays).
-            self._sync_copy_stream()
 
-            # Release the sender's pool slot. Must happen only after the
-            # copy-stream sync above — the sender may reuse the slot
-            # immediately.
-            self._mark_board_release(raw_obj["board"], int(raw_obj["slot_index"]))
+            # --- Multi-stream copy pipeline (CUDA-graph safe) ---
+            #
+            # Round-robin across N copy streams so concurrent D2D transfers
+            # overlap on the GPU. Credit release is deferred (event-based,
+            # no CPU synchronize on the hot path).
+            self._flush_deferred_releases()
+            idx = self._recv_stream_idx % len(self._recv_copy_streams)
+            self._recv_stream_idx += 1
+            copy_stream = self._recv_copy_streams[idx]
+            copy_done_event = self._recv_copy_events[idx]
+
+            event_handle = raw_obj.get("event_handle")
+            if event_handle:
+                ipc_event = self._open_ipc_event(event_handle)
+                # copy_stream waits for sender's copy to finish
+                self._cudart.cudaStreamWaitEvent(
+                    ctypes.c_void_p(copy_stream.cuda_stream),
+                    ipc_event,
+                    ctypes.c_uint(0),
+                )
+            # Order copy_stream after the local compute stream before we write
+            # into freshly-allocated dst tensors. dst comes from the caching
+            # allocator, which may hand back a block whose prior owner still has
+            # pending compute-stream work; without this barrier the copy_stream
+            # D2D can race that work and corrupt the tensor (intermittent
+            # nan/inf downstream).
+            copy_stream.wait_stream(torch.cuda.current_stream(self.local_device))
+            _t_pool = _time_mod.perf_counter()
+
+            # D2D copies on copy_stream (not compute stream)
+            obj = self._walk_decode_pool(
+                raw_obj["payload"],
+                pool_ptr,
+                raw_obj["slot_offset"],
+                stream=copy_stream,
+            )
+            _t_decode = _time_mod.perf_counter()
+
+            # Record event on copy_stream after all copies are issued
+            copy_done_event.record(copy_stream)
+
+            # Compute stream waits on copy_done_event (GPU-side dependency,
+            # no CPU block -- CUDA-graph capturable)
+            torch.cuda.current_stream(self.local_device).wait_event(copy_done_event)
+
+            # Defer credit release: the D2D is in flight on copy_stream.
+            # A background flush (called at the top of each get) polls the
+            # event and releases the credit once the GPU is done — no CPU
+            # synchronize on the hot path.
+            self._deferred_credit_releases.append(
+                (
+                    copy_done_event,
+                    raw_obj["board"],
+                    int(raw_obj["slot_index"]),
+                )
+            )
+            _t_sync = _time_mod.perf_counter()
 
             size = len(data_bytes)
+            get_n = self._metrics["gets"]
+            if get_n < 20 or get_n % 200 == 0:
+                logger.info(
+                    "IPC_GET #%d key=%s shm=%.3fms deser=%.3fms pool=%.3fms "
+                    "decode=%.3fms sync=%.3fms total=%.3fms size=%d",
+                    get_n,
+                    get_key,
+                    (_t_shm - _t0) * 1000,
+                    (_t_deser - _t_shm) * 1000,
+                    (_t_pool - _t_deser) * 1000,
+                    (_t_decode - _t_pool) * 1000,
+                    (_t_sync - _t_decode) * 1000,
+                    (_t_sync - _t0) * 1000,
+                    size,
+                )
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += size
             return obj, size
@@ -673,26 +774,21 @@ class CudaIPCConnector(OmniConnectorBase):
             return None
 
     def _try_get_shm_compat(self, get_key: str) -> tuple[Any, int] | None:
-        lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
         try:
-            with open(lock_file, "rb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX)
-                try:
-                    seg = shm_pkg.SharedMemory(name=get_key)
-                except FileNotFoundError:
-                    fcntl.flock(lockf, fcntl.LOCK_UN)
-                    return None
+            try:
+                seg = shm_pkg.SharedMemory(name=get_key)
+            except FileNotFoundError:
+                return None
 
+            try:
+                mv = memoryview(seg.buf)
+                data_bytes = bytes(mv[: seg.size])
+                del mv
+            finally:
                 try:
-                    mv = memoryview(seg.buf)
-                    data_bytes = bytes(mv[: seg.size])
-                    del mv
-                finally:
-                    try:
-                        seg.close()
-                    except Exception:
-                        pass
-                    fcntl.flock(lockf, fcntl.LOCK_UN)
+                    seg.close()
+                except Exception:
+                    pass
 
             try:
                 obj = self.deserialize_obj(data_bytes)
@@ -715,11 +811,6 @@ class CudaIPCConnector(OmniConnectorBase):
                             seg.close()
                     except Exception:
                         pass
-                    try:
-                        if os.path.exists(lock_file):
-                            os.remove(lock_file)
-                    except OSError:
-                        pass
                 return None
 
             self._shm_compat_decode_failures.pop(get_key, None)
@@ -731,8 +822,8 @@ class CudaIPCConnector(OmniConnectorBase):
                     seg.close()
             except Exception:
                 pass
-            if os.path.exists(lock_file):
-                os.remove(lock_file)
+
+            obj = self._move_to_device(obj)
 
             size = len(data_bytes)
             self._metrics["gets"] += 1
@@ -743,6 +834,18 @@ class CudaIPCConnector(OmniConnectorBase):
         except Exception as e:
             logger.warning("CudaIPCConnector shm_compat get failed for %s: %s", get_key, e)
             return None
+
+    def _move_to_device(self, obj: Any) -> Any:
+        """Move CPU tensors to local GPU so CUDA graph replay is safe."""
+        if isinstance(obj, torch.Tensor) and obj.device.type == "cpu":
+            return obj.to(self.local_device, non_blocking=True)
+        if isinstance(obj, dict):
+            return {k: self._move_to_device(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._move_to_device(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._move_to_device(v) for v in obj)
+        return obj
 
     # ------------------------------------------------------------------
     # Credit release: shared-memory board (fast path) + TTL sweep
@@ -887,17 +990,6 @@ class CudaIPCConnector(OmniConnectorBase):
             except Exception:
                 pass
         self._opened_boards.clear()
-
-        # Destroy CUDA stream / event
-        try:
-            if self._order_event is not None:
-                self._cudart.cudaEventDestroy(self._order_event)
-            if self._copy_stream is not None:
-                self._cudart.cudaStreamDestroy(self._copy_stream)
-        except Exception as e:
-            logger.warning("Failed to destroy CUDA stream/event: %s", e)
-        self._order_event = None
-        self._copy_stream = None
 
         self._pool = None
 

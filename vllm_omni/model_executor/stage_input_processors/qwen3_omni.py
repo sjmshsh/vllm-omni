@@ -595,12 +595,12 @@ def thinker2talker_full_payload(
 
     payload: OmniPayload = {
         "embed": {
-            "prefill": thinker_emb_prefill.detach().cpu(),
+            "prefill": thinker_emb_prefill.detach(),
             "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos")),
             "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos")),
             "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad")),
         },
-        "hidden_states": {"output": thinker_hid_prefill.detach().cpu()},
+        "hidden_states": {"output": thinker_hid_prefill.detach()},
         "ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
