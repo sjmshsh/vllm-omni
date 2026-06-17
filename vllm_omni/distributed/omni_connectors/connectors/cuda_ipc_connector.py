@@ -138,13 +138,19 @@ class CudaIPCConnector(OmniConnectorBase):
         if self.role not in {"sender", "receiver"}:
             raise ValueError(f"Invalid role={self.role!r}. Expected 'sender' or 'receiver'.")
         self.tensor_lifetime_sec = float(config.get("tensor_lifetime_sec", 30.0))
+        # Pre-warm: receiver opens the sender's static pool/event IPC handles at
+        # startup (via a published advert) instead of lazily on the first get(),
+        # moving the ~14 ms cudaIpcOpenMemHandle cold start off the TTFA path.
+        self._prewarm = bool(config.get("prewarm", False))
         self.local_device = self._resolve_local_device(config.get("local_device", "auto"))
         self._closed = False
         self._cudart = None
 
         self._held_lock = threading.Lock()
+        self._open_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._release_thread: threading.Thread | None = None
+        self._prewarm_thread: threading.Thread | None = None
         self._shm_compat_decode_failures: dict[str, int] = {}
 
         self._metrics = {
@@ -207,6 +213,8 @@ class CudaIPCConnector(OmniConnectorBase):
             self._board_name = f"cudaipc_board_{uuid.uuid4().hex[:16]}"
             self._board = shm_pkg.SharedMemory(create=True, size=pool_credits, name=self._board_name)
             self._board.buf[:pool_credits] = bytes(pool_credits)
+            if self._prewarm:
+                self._publish_handle_advert()
         else:
             self._pool = None
             self._pool_handle = None
@@ -236,6 +244,9 @@ class CudaIPCConnector(OmniConnectorBase):
                 target=self._release_loop, daemon=True, name="cuda-ipc-release-loop"
             )
             self._release_thread.start()
+        elif self._prewarm:
+            self._prewarm_thread = threading.Thread(target=self._prewarm_loop, daemon=True, name="cuda-ipc-prewarm")
+            self._prewarm_thread.start()
 
         logger.info(
             f"CudaIPCConnector initialized: role={self.role}, "
@@ -405,21 +416,85 @@ class CudaIPCConnector(OmniConnectorBase):
             logger.warning("cudaIpcCloseMemHandle failed with code %s", ret)
 
     def _open_pool(self, pool_handle: bytes) -> ctypes.c_void_p:
-        """Open a pool IPC handle (cached — only opened once per sender)."""
-        if pool_handle not in self._opened_pools:
-            self._opened_pools[pool_handle] = self._open_ipc_ptr(pool_handle)
-        return self._opened_pools[pool_handle]
+        """Open a pool IPC handle (cached — only opened once per sender).
+
+        Lock-guarded: the optional pre-warm thread and the recv thread may both
+        reach here, and cudaIpcOpenMemHandle on an already-open handle errors,
+        so the check-and-open must be atomic.
+        """
+        with self._open_lock:
+            if pool_handle not in self._opened_pools:
+                self._opened_pools[pool_handle] = self._open_ipc_ptr(pool_handle)
+            return self._opened_pools[pool_handle]
 
     def _open_ipc_event(self, handle_bytes: bytes) -> ctypes.c_void_p:
         """Open a CUDA IPC event handle (cached — only opened once per sender)."""
-        if handle_bytes not in self._opened_events:
-            handle = _CudaIpcEventHandle.from_buffer_copy(handle_bytes)
-            event = ctypes.c_void_p()
-            ret = self._cudart.cudaIpcOpenEventHandle(ctypes.byref(event), handle)
-            if ret != 0:
-                raise RuntimeError(f"cudaIpcOpenEventHandle failed: {ret}")
-            self._opened_events[handle_bytes] = event
-        return self._opened_events[handle_bytes]
+        with self._open_lock:
+            if handle_bytes not in self._opened_events:
+                handle = _CudaIpcEventHandle.from_buffer_copy(handle_bytes)
+                event = ctypes.c_void_p()
+                ret = self._cudart.cudaIpcOpenEventHandle(ctypes.byref(event), handle)
+                if ret != 0:
+                    raise RuntimeError(f"cudaIpcOpenEventHandle failed: {ret}")
+                self._opened_events[handle_bytes] = event
+            return self._opened_events[handle_bytes]
+
+    # ------------------------------------------------------------------
+    # Handle pre-warm (S2): kill the first-get cudaIpcOpenMemHandle cold start
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _advert_name(stage_id: int) -> str:
+        """Deterministic /dev/shm name where stage ``stage_id``'s sender
+        publishes its static pool + IPC-event handles for receiver pre-warm."""
+        return f"cudaipc_advert_s{stage_id}"
+
+    def _publish_handle_advert(self) -> None:
+        """Sender: publish the (static, lifetime-stable) pool and IPC-event
+        handles to a well-known SHM key so the downstream receiver can open them
+        once at startup. Best-effort; failure just leaves the receiver on the
+        lazy-open path."""
+        try:
+            blob = OmniSerializer.serialize(
+                {"pool_handle": self._pool_handle, "event_handle": self._ipc_event_handle_bytes}
+            )
+            self._atomic_shm_write(blob, name=self._advert_name(self.stage_id))
+        except Exception as e:
+            logger.warning("CudaIPCConnector handle advert publish failed: %s", e)
+
+    def _prewarm_loop(self) -> None:
+        """Receiver: best-effort one-shot warm-up. Wait for the upstream
+        sender's handle advert, then open + cache the pool and IPC-event handles
+        so the first real ``get()`` is a cache hit (no cold cudaIpcOpenMemHandle
+        on the TTFA path). A miss/timeout is harmless — the lazy open in
+        ``_try_get_ipc`` still works."""
+        advert = self._advert_name(self.stage_id - 1)
+        deadline = _time_mod.monotonic() + 30.0
+        while not self._stop_event.is_set() and _time_mod.monotonic() < deadline:
+            try:
+                seg = shm_pkg.SharedMemory(name=advert)
+            except FileNotFoundError:
+                self._stop_event.wait(timeout=0.05)
+                continue
+            try:
+                blob = bytes(seg.buf[: seg.size])
+            finally:
+                seg.close()
+                try:
+                    from multiprocessing.resource_tracker import unregister
+
+                    unregister(f"/{advert}", "shared_memory")
+                except Exception:
+                    pass
+            try:
+                info = OmniSerializer.deserialize(blob)
+                with torch.cuda.device(self.local_device):
+                    self._open_pool(info["pool_handle"])
+                    self._open_ipc_event(info["event_handle"])
+                logger.info("CudaIPCConnector receiver pre-warmed IPC handles from %s", advert)
+            except Exception as e:
+                logger.warning("CudaIPCConnector pre-warm failed (%s); using lazy open.", e)
+            return
 
     # ------------------------------------------------------------------
     # Pool-based encode / decode
@@ -964,6 +1039,8 @@ class CudaIPCConnector(OmniConnectorBase):
         self._stop_event.set()
         if self._release_thread is not None and self._release_thread.is_alive():
             self._release_thread.join(timeout=1.0)
+        if self._prewarm_thread is not None and self._prewarm_thread.is_alive():
+            self._prewarm_thread.join(timeout=1.0)
 
         with self._held_lock:
             self._held_credits.clear()
@@ -984,6 +1061,17 @@ class CudaIPCConnector(OmniConnectorBase):
             except Exception as e:
                 logger.warning("Failed to release board: %s", e)
             self._board = None
+
+        # Unlink the published handle advert (sender, pre-warm).
+        if self.role == "sender" and self._prewarm:
+            try:
+                seg = shm_pkg.SharedMemory(name=self._advert_name(self.stage_id))
+                seg.close()
+                seg.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.warning("Failed to unlink handle advert: %s", e)
         for board in self._opened_boards.values():
             try:
                 board.close()
