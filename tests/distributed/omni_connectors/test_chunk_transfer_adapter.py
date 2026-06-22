@@ -120,6 +120,52 @@ def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, ex
     assert captured["spec"].extra == expected_extra
 
 
+_DUAL_CFG = {
+    "input": {"name": "SharedMemoryConnector"},
+    "output": {"name": "CudaIPCConnector", "extra": {"use_ring": True}},
+}
+
+
+@pytest.mark.parametrize(
+    ("raw_cfg", "direction", "expected"),
+    [
+        # Dual spec: each direction resolves to its own sub-config. The input edge gets
+        # SHM, the output (send) edge gets CudaIPC — the mixed setup where the capability
+        # check on the send path must read from `output_connector`, not the shared one.
+        (_DUAL_CFG, "input", ("SharedMemoryConnector", {})),
+        (_DUAL_CFG, "output", ("CudaIPCConnector", {"use_ring": True})),
+        # A direction that is not configured returns None (and never calls the factory).
+        ({"input": {"name": "SharedMemoryConnector"}}, "output", None),
+        ({"output": {"name": "CudaIPCConnector"}}, "input", None),
+    ],
+)
+def test_create_connector_dual_direction(monkeypatch, raw_cfg, direction, expected):
+    captured = {}
+
+    def _fake_create(spec):
+        captured["spec"] = spec
+        return "ok"
+
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter"
+        ".OmniConnectorFactory.create_connector",
+        _fake_create,
+    )
+
+    model_config = SimpleNamespace(stage_connector_config=raw_cfg)
+    connector = OmniChunkTransferAdapter.create_connector(model_config, direction)
+
+    if expected is None:
+        assert connector is None
+        assert "spec" not in captured  # unconfigured direction -> factory not called
+    else:
+        expected_name, expected_extra = expected
+        assert connector == "ok"
+        assert isinstance(captured["spec"], ConnectorSpec)
+        assert captured["spec"].name == expected_name
+        assert captured["spec"].extra == expected_extra
+
+
 def test_load_poll(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")

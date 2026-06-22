@@ -157,7 +157,6 @@ class CudaIPCConnector(OmniConnectorBase):
         # as the kill-switch fallback for the first release. When on, put()/get() route
         # through a pre-allocated per-edge SPSC mailbox (see _ipc_ring.IpcRing); small
         # payloads ride inline, big ones use the existing pool + D2D.
-        self._use_ring = bool(config.get("use_ring", False))
         self._inline_threshold = int(config.get("inline_threshold_bytes", 16384))
         self._ring_entries_cfg = int(config.get("ring_entries", 0))  # 0 => auto from credits
         # Ring slot body must hold the LARGER of: an inline small payload, OR a pool
@@ -246,16 +245,15 @@ class CudaIPCConnector(OmniConnectorBase):
             self._board.buf[:pool_credits] = bytes(pool_credits)
             if self._prewarm:
                 self._publish_handle_advert()
-            if self._use_ring:
-                n_slots = self._ring_entries_cfg or max(64, pool_credits * 4)
-                body_max = max(self._ring_body_max, self._inline_threshold)
-                self._ring = IpcRing.create(
-                    self._ring_name(self.stage_id, self.stage_id + 1),
-                    n_slots,
-                    body_max,
-                    header_bytes=_RING_HEADER_BYTES,
-                )
-                self._ring.write_header(self._ring_header_blob())
+            n_slots = self._ring_entries_cfg or max(64, pool_credits * 4)
+            body_max = max(self._ring_body_max, self._inline_threshold)
+            self._ring = IpcRing.create(
+                self._ring_name(self.stage_id, self.stage_id + 1),
+                n_slots,
+                body_max,
+                header_bytes=_RING_HEADER_BYTES,
+            )
+            self._ring.write_header(self._ring_header_blob())
         else:
             self._pool = None
             self._pool_handle = None
@@ -316,9 +314,6 @@ class CudaIPCConnector(OmniConnectorBase):
         """Generate a short, collision-free SHM name via SHA1 hash."""
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
         return f"{prefix}_{digest}"
-
-    def _payload_name(self, composite_key: str) -> str:
-        return self._safe_name("cudaipc", composite_key)
 
     @staticmethod
     def _atomic_shm_write(payload: bytes, name: str) -> dict[str, Any]:
@@ -507,7 +502,7 @@ class CudaIPCConnector(OmniConnectorBase):
         sender's handle advert, then open + cache the pool and IPC-event handles
         so the first real ``get()`` is a cache hit (no cold cudaIpcOpenMemHandle
         on the TTFA path). A miss/timeout is harmless — the lazy open in
-        ``_try_get_ipc`` still works."""
+        ``_get_ring`` still works."""
         advert = self._advert_name(self.stage_id - 1)
         deadline = _time_mod.monotonic() + 30.0
         while not self._stop_event.is_set() and _time_mod.monotonic() < deadline:
@@ -591,7 +586,7 @@ class CudaIPCConnector(OmniConnectorBase):
         # BEFORE the cudaMemcpyAsync; that registered a free-protection event ahead of
         # the copy, and at dst's destruction the allocator's insert_events iterated that
         # stream and hit the poisoned context (illegal access in ~TensorImpl). Since the
-        # caller (_get_ring / _try_get_ipc) now synchronizes copy_done_event before
+        # caller (_get_ring) now synchronizes copy_done_event before
         # returning, dst's lifetime is covered by that hard sync — correct by construction.
         with torch.cuda.stream(target_stream):
             dst = torch.empty(shape, dtype=dtype, device=self.local_device)
@@ -641,83 +636,7 @@ class CudaIPCConnector(OmniConnectorBase):
             return False, 0, None
 
         composite_key = f"{put_key}@{from_stage}_{to_stage}"
-        if self._use_ring:
-            return self._put_ring(from_stage, to_stage, put_key, composite_key, data)
-
-        try:
-            slot_offset = self._acquire_credit()
-            if slot_offset is None:
-                return self._put_cpu_fallback(
-                    from_stage, to_stage, put_key, composite_key, data, reason="credits_exhausted"
-                )
-
-            credit_returned = False
-            try:
-                self._board.buf[slot_offset // self._slot_size] = 0
-
-                slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
-                self._compute_event.record()
-                self._copy_stream.wait_event(self._compute_event)
-                try:
-                    with torch.cuda.stream(self._copy_stream):
-                        encoded_obj = self._walk_encode_pool(data, slot)
-                except _SlotOverflowError as e:
-                    self._copy_done_event.record(self._copy_stream)
-                    self._copy_done_event.synchronize()
-                    credit_returned = True
-                    self._credit_queue.put_nowait(slot_offset)
-                    return self._put_cpu_fallback(
-                        from_stage,
-                        to_stage,
-                        put_key,
-                        composite_key,
-                        data,
-                        reason=f"slot_overflow nbytes={e.nbytes} slot={e.slot_size}",
-                    )
-
-                ret = self._cudart.cudaEventRecord(
-                    self._ipc_event,
-                    ctypes.c_void_p(self._copy_stream.cuda_stream),
-                )
-                if ret != 0:
-                    logger.warning("cudaEventRecord (IPC) failed: %d", ret)
-
-                wrapped = {
-                    _POOL_MARKER: True,
-                    "pool_handle": self._pool_handle,
-                    "slot_offset": slot_offset,
-                    "board": self._board_name,
-                    "slot_index": slot_offset // self._slot_size,
-                    "event_handle": self._ipc_event_handle_bytes,
-                    "payload": encoded_obj,
-                }
-                payload = OmniSerializer.serialize(wrapped)
-                size = len(payload)
-            except Exception:
-                if not credit_returned:
-                    self._credit_queue.put_nowait(slot_offset)
-                raise
-
-            with self._held_lock:
-                self._held_credits[composite_key] = (_time_mod.time(), slot_offset)
-
-            payload_name = self._payload_name(composite_key)
-            try:
-                meta = self._atomic_shm_write(payload, name=payload_name)
-            except Exception:
-                with self._held_lock:
-                    self._held_credits.pop(composite_key, None)
-                self._credit_queue.put_nowait(slot_offset)
-                raise
-
-            self._metrics["puts"] += 1
-            self._metrics["bytes_transferred"] += size
-            return True, size, {"shm": meta, "size": size}
-
-        except Exception as e:
-            self._metrics["errors"] += 1
-            logger.error("CudaIPCConnector put failed for %s: %s", put_key, e, exc_info=True)
-            return False, 0, None
+        return self._put_ring(from_stage, to_stage, put_key, composite_key, data)
 
     def _put_cpu_fallback(
         self,
@@ -750,7 +669,7 @@ class CudaIPCConnector(OmniConnectorBase):
 
     # ------------------------------------------------------------------
     # Ring control plane (P1.2) — put/get over the per-edge SPSC mailbox.
-    # Gated by self._use_ring; replaces the per-transfer /dev/shm round-trip.
+    # The only transport path; replaces the per-transfer /dev/shm round-trip.
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -948,7 +867,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 self._metrics["bytes_transferred"] += len(body)
                 return obj, len(body)
 
-            # POOL: mirror _try_get_ipc, reading the edge-constant handles from the
+            # POOL: read the edge-constant handles from the
             # ring header and the slot descriptor from the entry body.
             pool_handle, event_handle, board_name = self._ring_edge_handles[(from_stage, to_stage)]
             raw = OmniSerializer.deserialize(body)
@@ -1000,87 +919,7 @@ class CudaIPCConnector(OmniConnectorBase):
             return None
 
         composite_key = f"{get_key}@{from_stage}_{to_stage}"
-        if self._use_ring:
-            return self._get_ring(from_stage, to_stage, get_key, composite_key)
-        payload_name = self._payload_name(composite_key)
-        if os.path.exists(f"/dev/shm/{payload_name}"):
-            return self._try_get_ipc(get_key, payload_name)
-        return self._try_get_shm_compat(get_key)
-
-    def _try_get_ipc(
-        self,
-        get_key: str,
-        payload_name: str,
-    ) -> tuple[Any, int] | None:
-        try:
-            seg = shm_pkg.SharedMemory(name=payload_name)
-            try:
-                data_bytes = bytes(seg.buf[: seg.size])
-            finally:
-                seg.close()
-                seg.unlink()
-
-            raw_obj = OmniSerializer.deserialize(data_bytes)
-            if not isinstance(raw_obj, dict) or not raw_obj.get(_POOL_MARKER):
-                logger.error("CudaIPCConnector get: unexpected payload format for %s (corrupt segment?)", get_key)
-                return None
-
-            pool_ptr = self._open_pool(raw_obj["pool_handle"])
-
-            # --- Multi-stream copy pipeline (CUDA-graph safe) ---
-            #
-            # Round-robin across N copy streams so concurrent D2D transfers overlap.
-            idx = self._recv_stream_idx % len(self._recv_copy_streams)
-            self._recv_stream_idx += 1
-            copy_stream = self._recv_copy_streams[idx]
-            copy_done_event = self._recv_copy_events[idx]
-
-            event_handle = raw_obj.get("event_handle")
-            if event_handle:
-                ipc_event = self._open_ipc_event(event_handle)
-                # copy_stream waits for sender's copy to finish
-                self._cudart.cudaStreamWaitEvent(
-                    ctypes.c_void_p(copy_stream.cuda_stream),
-                    ipc_event,
-                    ctypes.c_uint(0),
-                )
-            # Order copy_stream after the local compute stream before we write
-            # into freshly-allocated dst tensors. dst comes from the caching
-            # allocator, which may hand back a block whose prior owner still has
-            # pending compute-stream work; without this barrier the copy_stream
-            # D2D can race that work and corrupt the tensor (intermittent
-            # nan/inf downstream).
-            copy_stream.wait_stream(torch.cuda.current_stream(self.local_device))
-
-            # D2D copies on copy_stream (not compute stream)
-            obj = self._walk_decode_pool(
-                raw_obj["payload"],
-                pool_ptr,
-                raw_obj["slot_offset"],
-                stream=copy_stream,
-            )
-
-            # Record event on copy_stream after all copies are issued
-            copy_done_event.record(copy_stream)
-
-            # BLOCK until the D2D completes, then release the credit SYNCHRONOUSLY. The
-            # payload is consumed on the model thread later; a deferred event-only barrier
-            # raced (board/TTL ABA + dst caching-allocator reuse before the D2D finished).
-            # Synchronizing here is correct-by-construction; the recv thread blocks ~ms per
-            # big chunk. (See the matching note in _get_ring.)
-            copy_done_event.synchronize()
-            self._mark_board_release(raw_obj["board"], int(raw_obj["slot_index"]))
-
-            size = len(data_bytes)
-            self._metrics["gets"] += 1
-            self._metrics["bytes_transferred"] += size
-            return obj, size
-        except FileNotFoundError:
-            return None
-        except Exception as e:
-            self._metrics["errors"] += 1
-            logger.error("CudaIPCConnector IPC get failed for %s: %s", get_key, e, exc_info=True)
-            return None
+        return self._get_ring(from_stage, to_stage, get_key, composite_key)
 
     def _try_get_shm_compat(self, get_key: str) -> tuple[Any, int] | None:
         try:
