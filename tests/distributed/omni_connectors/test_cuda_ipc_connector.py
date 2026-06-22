@@ -1,29 +1,164 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for CudaIPCConnector basic functionality.
+"""Unit tests for the CudaIPC connector and its IpcRing control plane.
 
-CUDA IPC handles require cross-process usage (cudaIpcOpenMemHandle cannot be
-called in the same process that called cudaIpcGetMemHandle).  All put/get
-tests spawn sender + receiver in separate processes, coordinated via queues.
+Two layers, gated independently:
 
-Requires at least one CUDA GPU.  Skipped automatically when CUDA is unavailable.
+1. ``IpcRing`` (the lock-free SPSC keyed-mailbox control plane in ``_ipc_ring.py``):
+   pure-Python, NO CUDA — these tests run anywhere, incl. CPU-only CI. The module is
+   loaded by file path so importing it does not pull in the vllm_omni package (torch/vllm).
+
+2. ``CudaIPCConnector`` functional put/get: requires a real GPU. CUDA IPC handles cannot be
+   opened in the same process that created them, so these spawn sender + receiver processes.
+   The GPU gate is on ``TestCudaIPCFunctional`` (class level), NOT module level, so it does
+   not skip the CPU ring tests above.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import multiprocessing as mp
+import os
+import uuid
 from typing import Any
 
 import pytest
 import torch
 
-pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-    pytest.mark.gpu,
-]
+# ════════════════════════════════════════════════════════════════════
+# Layer 1 — IpcRing control plane (CPU-only, runs in CI without a GPU)
+# ════════════════════════════════════════════════════════════════════
+#
+# Single-mapping publish/poll protocol tests. Cross-process / cross-mapping integrity is
+# separately exercised by tests/dfx/perf/ipc_ring_soak.py (the real deployment shape).
+# NOTE: same-process re-open() of a SharedMemory segment is not coherent on macOS, so these
+# poll from the producing ring object directly.
+
+_RING_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    "..",
+    "vllm_omni",
+    "distributed",
+    "omni_connectors",
+    "connectors",
+    "_ipc_ring.py",
+)
+_spec = importlib.util.spec_from_file_location("_ipc_ring_under_test", _RING_PATH)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+IpcRing, RingFull = _mod.IpcRing, _mod.RingFull
 
 
-# ── Multi-process helpers ───────────────────────────────────────────
+def _kh(s: str) -> bytes:
+    """16-byte key hash, as the connector derives via sha1(key)[:16]."""
+    import hashlib
+
+    return hashlib.sha1(s.encode()).digest()[:16]
+
+
+@pytest.fixture()
+def ring():
+    """A small sender-owned ring; unlinks on close."""
+    name = f"test_ipc_ring_{uuid.uuid4().hex[:12]}"
+    r = IpcRing.create(name, n_slots=8, body_max=64, header_bytes=32)
+    yield r
+    r.close()
+
+
+def test_ring_header_round_trip(ring):
+    blob = b"edge-constant-handles\x00\x01\x02"
+    ring.write_header(blob)
+    assert ring.read_header(len(blob)) == blob
+
+
+def test_ring_header_overflow_rejected(ring):
+    with pytest.raises(ValueError):
+        ring.write_header(b"x" * 33)  # header_bytes=32
+
+
+def test_ring_publish_then_poll(ring):
+    kh = _kh("req-A_0_1")
+    ring.publish(kh, pclass=0, body=b"hello")
+    got = ring.poll(kh)
+    assert got is not None
+    pclass, body = got
+    assert pclass == 0 and body == b"hello"
+
+
+def test_ring_poll_miss_returns_none(ring):
+    assert ring.poll(_kh("never-published")) is None
+
+
+def test_ring_pclass_is_carried(ring):
+    ring.publish(_kh("k-inline"), pclass=0, body=b"a")
+    ring.publish(_kh("k-pool"), pclass=1, body=b"bb")
+    assert ring.poll(_kh("k-inline"))[0] == 0
+    assert ring.poll(_kh("k-pool"))[0] == 1
+
+
+def test_ring_poll_marks_consumed_once(ring):
+    kh = _kh("once")
+    ring.publish(kh, 0, b"x")
+    assert ring.poll(kh) is not None  # first poll consumes
+    assert ring.poll(kh) is None  # second poll: already consumed
+
+
+def test_ring_consumed_slot_is_reused(ring):
+    """Producer must reuse a slot the consumer has taken — else the ring wedges after
+    n_slots publishes. Round-trips far more entries than slots."""
+    for i in range(8 * 20):  # 160 entries through 8 slots
+        kh = _kh(f"seq-{i}")
+        ring.publish(kh, 0, b"%d" % i)
+        got = ring.poll(kh)
+        assert got is not None and got[1] == b"%d" % i
+
+
+def test_ring_open_addressed_collision(ring):
+    """Distinct keys that may land on the same home slot must each be retrievable."""
+    keys = [_kh(f"collide-{i}") for i in range(6)]  # < n_slots, all live at once
+    for i, k in enumerate(keys):
+        ring.publish(k, 0, b"v%d" % i)
+    for i, k in enumerate(keys):
+        got = ring.poll(k)
+        assert got is not None and got[1] == b"v%d" % i
+
+
+def test_ring_full_raises(ring):
+    for i in range(8):  # fill all 8 slots without consuming
+        ring.publish(_kh(f"fill-{i}"), 0, b"z")
+    with pytest.raises(RingFull):
+        ring.publish(_kh("one-too-many"), 0, b"z")
+
+
+def test_ring_body_too_big_raises(ring):
+    with pytest.raises(ValueError):
+        ring.publish(_kh("big"), 0, b"x" * 65)  # body_max=64
+
+
+def test_ring_ttl_reclaims_stale_entry(ring):
+    """C4: an occupied-but-unconsumed slot older than ttl_sec is reclaimed in place so an
+    aborted/never-polled request cannot wedge the ring. Fresh entries are NOT reclaimed."""
+    for i in range(8):  # fill at t=100, never consumed
+        ring.publish(_kh(f"stale-{i}"), 0, b"old", ts=100, ttl_sec=30)
+    with pytest.raises(RingFull):  # t=110 within ttl -> still full
+        ring.publish(_kh("fresh"), 0, b"new", ts=110, ttl_sec=30)
+    # t=200: the t=100 entries are stale (>30s) -> reclaimed in place, publish succeeds
+    ring.publish(_kh("after-ttl"), 0, b"new", ts=200, ttl_sec=30)
+
+
+def test_ring_ttl_zero_never_reclaims(ring):
+    """ttl_sec=0 disables reclaim — full ring stays full regardless of ts."""
+    for i in range(8):
+        ring.publish(_kh(f"x-{i}"), 0, b"o", ts=100, ttl_sec=0)
+    with pytest.raises(RingFull):
+        ring.publish(_kh("y"), 0, b"n", ts=999999, ttl_sec=0)
+
+
+# ════════════════════════════════════════════════════════════════════
+# Layer 2 — CudaIPCConnector functional put/get (requires a GPU)
+# ════════════════════════════════════════════════════════════════════
 
 
 def _sender_proc(cmd_q: mp.Queue, res_q: mp.Queue, cfg: dict):
@@ -170,9 +305,8 @@ def harness():
     h.close()
 
 
-# ── Functional tests ────────────────────────────────────────────────
-
-
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestCudaIPCFunctional:
     def test_put_then_get(self, harness):
         spec = {"hidden": _tspec((128, 256)), "meta": {"req_id": "r1"}}

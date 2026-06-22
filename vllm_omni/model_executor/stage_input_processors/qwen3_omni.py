@@ -445,7 +445,8 @@ def thinker2talker_async_chunk(
     3. Package for talker with additional information
     """
 
-    _connector = getattr(transfer_manager, "connector", None)
+    # This is the SEND edge (thinker -> talker); supported for a dual-connector.
+    _connector = getattr(transfer_manager, "output_connector", None) or getattr(transfer_manager, "connector", None)
     _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
 
     request_id = request.external_req_id
