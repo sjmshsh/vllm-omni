@@ -141,6 +141,24 @@ def test_ring_ttl_zero_never_reclaims(ring):
         ring.publish(_kh("y"), 0, b"n", ts=999999, ttl_sec=0)
 
 
+def test_ring_name_isolates_deployment_and_replica():
+    """The /dev/shm ring name must be unique per (deployment_id, edge, replica_id) so
+    co-located services and same-host replicas don't unlink each other's rings. Built via
+    object.__new__ to exercise the pure naming formula without a GPU."""
+    from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import CudaIPCConnector
+
+    c = object.__new__(CudaIPCConnector)
+    c._deployment_id, c._replica_id = "dep7", 0
+    assert c._ring_name("0", "1") == "cudaipc_dep7_s0_s1_r0"
+    # int stage (sender side) and str stage (receiver side) must format identically.
+    assert c._ring_name(0, 1) == c._ring_name("0", "1")
+    # replica_id and deployment_id each make the name distinct.
+    c._replica_id = 3
+    assert c._ring_name("0", "1") == "cudaipc_dep7_s0_s1_r3"
+    c._deployment_id = "depZ"
+    assert c._ring_name("0", "1") == "cudaipc_depZ_s0_s1_r3"
+
+
 # ════════════════════════════════════════════════════════════════════
 # Layer 2 — CudaIPCConnector functional put/get (requires a GPU)
 # ════════════════════════════════════════════════════════════════════
@@ -295,10 +313,13 @@ def harness():
 class TestCudaIPCFunctional:
     def test_put_then_get(self, harness):
         spec = {"hidden": _tspec((128, 256)), "meta": {"req_id": "r1"}}
-        ok, size, meta = harness.put("s0", "s1", "req_1", spec)
+        ok, size, meta = harness.put("0", "1", "req_1", spec)
         assert ok and size > 0
+        # Pin the ring transport: a stage-id/name mismatch would silently route through the
+        # SHM fallback and still "pass", masking a broken ring path.
+        assert not meta.get("cpu_fallback"), "expected ring/pool path, got SHM fallback"
 
-        result = harness.get("s0", "s1", "req_1", meta=meta)
+        result = harness.get("0", "1", "req_1", meta=meta)
         assert result is not None
         summary, _ = result
         assert summary["hidden"]["shape"] == [128, 256]
@@ -307,18 +328,18 @@ class TestCudaIPCFunctional:
 
     def test_multiple_keys(self, harness):
         for i in range(8):
-            ok, _, _ = harness.put("s0", "s1", f"req_{i}", {"h": _tspec((64, 128)), "i": i})
+            ok, _, _ = harness.put("0", "1", f"req_{i}", {"h": _tspec((64, 128)), "i": i})
             assert ok
 
         for i in range(8):
-            result = harness.get("s0", "s1", f"req_{i}")
+            result = harness.get("0", "1", f"req_{i}")
             assert result is not None
             summary, _ = result
             assert summary["i"] == i
 
     def test_cpu_fallback_on_overflow(self, harness):
         spec = {"big": _tspec((8 * 1024 * 1024,), "float32")}
-        ok, _, meta = harness.put("s0", "s1", "big_req", spec)
+        ok, _, meta = harness.put("0", "1", "big_req", spec)
         assert ok
         assert meta.get("cpu_fallback", False)
 

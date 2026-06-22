@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import signal
+import uuid
 from types import FrameType
 
 import uvloop
@@ -104,6 +105,14 @@ class OmniServeCommand(CLISubcommand):
         if args.headless:
             run_headless(args)
         else:
+            # Head: fix the deployment id ONCE (CLI > env > generated) and export it so the
+            # spawned stage workers inherit a consistent value for connector ring naming.
+            # Headless workers must NOT generate their own — they read the inherited env.
+            os.environ["VLLM_OMNI_DEPLOYMENT_ID"] = (
+                getattr(args, "deployment_id", None)
+                or os.environ.get("VLLM_OMNI_DEPLOYMENT_ID")
+                or uuid.uuid4().hex[:12]
+            )
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
@@ -733,6 +742,7 @@ def run_headless(args: TrackingNamespace) -> None:
         inject_omni_kv_connector_config,
         load_omni_transfer_config_for_model,
         prepare_engine_environment,
+        resolve_deployment_id,
     )
     from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
 
@@ -822,6 +832,8 @@ def run_headless(args: TrackingNamespace) -> None:
         model,
         stage_connector_spec=stage_connector_spec,
         cli_tokenizer=getattr(args, "tokenizer", None),
+        deployment_id=resolve_deployment_id(getattr(args, "deployment_id", None)),
+        num_replicas=omni_dp_size_local or 1,
     )
 
     inject_omni_kv_connector_config(engine_args_dict, omni_kv_connector, stage_id)

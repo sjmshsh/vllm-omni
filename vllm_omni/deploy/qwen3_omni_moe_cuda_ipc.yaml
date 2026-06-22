@@ -21,8 +21,8 @@ connectors:
       pool_size_mb: 1536
       pool_credits: 32
       inline_threshold_bytes: 16384   # < 16KB -> inline (no credit/pool/D2D)
-      ring_body_max: 131072           # 128KB: holds inline small payloads AND pool
-      # 2048 slots x 128KB = 256MB host shm per ring — absorbs the lag.
+      ring_body_max: 524288           # 512KB: pool descriptors (ids ~40KB@in4000) + headroom
+      # 2048 slots x 512KB ~ 1GB host shm per ring (~2GB for s0->s1 + s1->s2).
       ring_entries: 2048
       initial_codec_chunk_frames: 4
       codec_chunk_frames: 25

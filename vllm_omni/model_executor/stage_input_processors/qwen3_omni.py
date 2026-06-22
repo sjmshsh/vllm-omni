@@ -597,11 +597,8 @@ def thinker2talker_full_payload(
     else:
         thinker_hid_prefill = thinker_hid
 
-    # Honor the output connector's capability uniformly: a GPU-tensor connector
-    # (CudaIPC) keeps tensors on-device for D2D; otherwise drop to CPU (the
-    # SharedMemoryConnector wire format). Previously prefill/output were left on
-    # GPU unconditionally while tts_* were forced to CPU — inconsistent, and for a
-    # non-GPU connector it leaned on the serializer's .cpu() safety net.
+    # Honor the output connector's capability: a GPU-tensor connector (CudaIPC) keeps
+    # tensors on-device for D2D; otherwise drop to CPU (SharedMemoryConnector wire format).
     _connector = getattr(transfer_manager, "output_connector", None) or getattr(transfer_manager, "connector", None)
     _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
 

@@ -40,6 +40,17 @@ _OFF_SEQ, _OFF_CONSUMED, _OFF_PCLASS, _OFF_TS, _OFF_KEY, _OFF_LEN, _OFF_BODY = 0
 _KEY_BYTES = 16
 
 
+def untrack_shm(name: str) -> None:
+    """Drop the resource_tracker registration for a non-owner attach, so this process
+    does not unlink the owner's segment at its own exit (only the owner unlinks)."""
+    try:
+        from multiprocessing.resource_tracker import unregister
+
+        unregister(f"/{name}", "shared_memory")
+    except Exception:
+        pass
+
+
 class RingFullError(Exception):
     """Raised by publish() when no free slot exists in the probe window (backpressure)."""
 
@@ -71,13 +82,16 @@ class CudaIpcControlRing:
         except FileNotFoundError:
             pass
         shm = shm_pkg.SharedMemory(create=True, size=size, name=name)
-        shm.buf[:size] = bytes(size)  # zero => all slots empty (seq==0)
+        # POSIX shm_open + ftruncate zero-fills the new segment, so every slot already
+        # reads seq==0 (empty). No explicit memset — avoids a transient bytes(size) heap
+        # spike (a 2048 x 128KB ring = 256MB) on the hot init path.
         struct.pack_into("<II", shm.buf, 0, n_slots, body_max)
         return cls(shm, n_slots, body_max, header_bytes, owner=True)
 
     @classmethod
     def open(cls, name):
         shm = shm_pkg.SharedMemory(name=name)
+        untrack_shm(name)  # non-owner: never unlink the sender's ring at exit
         n_slots, body_max = struct.unpack_from("<II", shm.buf, 0)
         # header size is implied by the on-wire layout the sender chose; the caller
         # passes the same header_bytes contract. We recover it from total size.

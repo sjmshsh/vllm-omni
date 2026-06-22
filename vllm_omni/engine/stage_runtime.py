@@ -59,6 +59,7 @@ from vllm_omni.engine.stage_init_utils import (
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
+    resolve_deployment_id,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
@@ -361,6 +362,8 @@ class StageRuntime:
                     self._model,
                     stage_connector_spec=stage_connector_spec,
                     cli_tokenizer=self._tokenizer,
+                    deployment_id=resolve_deployment_id(),
+                    num_replicas=num_replicas,
                 )
                 inject_omni_kv_connector_config(
                     engine_args_dict,

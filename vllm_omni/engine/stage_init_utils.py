@@ -679,11 +679,45 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
                 os.environ[key] = old_value
 
 
+def resolve_deployment_id(explicit: str | None = None) -> str:
+    """Resolve the deployment instance id used to isolate co-located services / runs.
+
+    Priority: explicit (CLI / deploy config) > ``VLLM_OMNI_DEPLOYMENT_ID`` env > ``"default"``.
+    NEVER generate it here per-worker — sender and receiver must agree, so a single value is
+    generated once by the launcher/coordinator and propagated (e.g. via the env var).
+    """
+    if explicit:
+        return str(explicit)
+    return os.environ.get("VLLM_OMNI_DEPLOYMENT_ID") or "default"
+
+
+def _inject_connector_identity(spec: dict[str, Any], *, deployment_id: str, num_replicas: int) -> dict[str, Any]:
+    """Inject deployment/replica identity into each connector sub-spec's ``extra`` so a
+    GPU-direct connector (CudaIPC) can name per-edge shm resources uniquely. ``replica_id``
+    is NOT injected here: it is auto-assigned by OmniMasterServer at runtime, not known at
+    launch — the connector defaults it and assumes aligned 1:1 stage replicas for now."""
+    ident = {"deployment_id": deployment_id, "num_replicas": num_replicas}
+
+    def _apply(sub: Any) -> Any:
+        if not isinstance(sub, dict):
+            return sub
+        extra = dict(sub.get("extra") or {})
+        for k, v in ident.items():
+            extra.setdefault(k, v)
+        return {**sub, "extra": extra}
+
+    if "input" in spec or "output" in spec:
+        return {k: (_apply(v) if k in ("input", "output") else v) for k, v in spec.items()}
+    return _apply(spec)
+
+
 def build_engine_args_dict(
     stage_config: Any,
     model: str,
     stage_connector_spec: dict[str, Any] | None = None,
     cli_tokenizer: str | None = None,
+    deployment_id: str = "default",
+    num_replicas: int = 1,
 ) -> dict[str, Any]:
     """Build the normalized engine args dict for one stage."""
     engine_args = stage_config.engine_args
@@ -712,12 +746,11 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    # Propagate the resolved connector spec to the stage worker for BOTH modes.
-    # full_payload (async_chunk=false) also uses self._output_connector in
-    # send_full_payload_outputs, so gating this on async_chunk silently dropped
-    # the configured connector (e.g. CudaIPC) and the worker fell back to the
-    # SharedMemoryConnector default.
-    engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
+    # Propagate the connector spec for BOTH modes: full_payload (async_chunk=false) also
+    # uses _output_connector, so gating on async_chunk would drop the configured connector.
+    engine_args_dict["stage_connector_spec"] = _inject_connector_identity(
+        dict(stage_connector_spec or {}), deployment_id=deployment_id, num_replicas=num_replicas
+    )
 
     if stage_type == "diffusion":
         from vllm_omni.diffusion.data import parse_attention_config

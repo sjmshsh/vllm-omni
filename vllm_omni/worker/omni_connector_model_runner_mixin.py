@@ -100,7 +100,12 @@ class OmniConnectorModelRunnerMixin:
         """
         self._input_connector: OmniConnectorBase | None
         self._output_connector: OmniConnectorBase | None
-        self._input_connector, self._output_connector = self._create_connectors(model_config)
+        # Resolve the data-transfer rank BEFORE building connectors: on TP>1 only this rank
+        # may own the per-edge ring, so it is injected into the connector config.
+        self._local_rank = self._parse_rank_mapping(model_config)["local_rank"]
+        self._input_connector, self._output_connector = self._create_connectors(
+            model_config, is_transfer_rank=self.is_data_transfer_rank()
+        )
         self._omni_connector: OmniConnectorBase | None = self._input_connector or self._output_connector
         self._kv_transfer_manager = kv_transfer_manager
 
@@ -2139,12 +2144,18 @@ class OmniConnectorModelRunnerMixin:
         return snapshot
 
     @staticmethod
-    def _create_connectors(model_config: Any) -> tuple[OmniConnectorBase | None, OmniConnectorBase | None]:
+    def _create_connectors(
+        model_config: Any, is_transfer_rank: bool = True
+    ) -> tuple[OmniConnectorBase | None, OmniConnectorBase | None]:
         """Create (input_connector, output_connector) from model_config.
 
         Dual-connector format ``{"input": {...}, "output": {...}}`` produces
         separate instances.  Legacy single format shares one instance for both.
         Returns ``(None, None)`` when unconfigured.
+
+        ``is_transfer_rank`` is forwarded into each connector's extra config so a
+        GPU-direct connector (CudaIPC) only creates per-edge resources on the rank
+        that actually transmits (TP>1 owns one ring per edge, not one per rank).
         """
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is None:
@@ -2163,6 +2174,8 @@ class OmniConnectorModelRunnerMixin:
             extra = spec_dict.get("extra") or {}
             if not isinstance(extra, dict):
                 raise RuntimeError(f"Invalid extra config for connector {name}: expected dict")
+            # Inject the rank role; an explicit config value (if any) still wins.
+            extra = {"is_transfer_rank": is_transfer_rank, **extra}
             return OmniConnectorFactory.create_connector(ConnectorSpec(name=name.strip(), extra=extra))
 
         if "input" in connector_config or "output" in connector_config:
