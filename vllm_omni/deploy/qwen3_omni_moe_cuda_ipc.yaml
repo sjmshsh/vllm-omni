@@ -1,13 +1,12 @@
-# Qwen3-Omni-MoE deploy with CudaIPCConnector for ALL stage edges.
+# Qwen3-Omni-MoE — CudaIPCConnector (one stage per GPU, all cross-GPU CudaIPC).
 #
-# Uses CudaIPCConnector for both cross-GPU (stage0→1, D2D via NVLink/PCIe)
-# and same-GPU (stage1→2, local D2D copy) transfers. Pool sizing: the
-# 512MB / 256-credit pool (2MB slots) absorbs talker→code2wav chunk bursts
-# at concurrency 4 with <0.1% CPU fallbacks; 2MB slots fit the first-chunk
-# prefill embeddings (~1.6MB at bf16 for a 200-token prompt).
+# The connector routes put()/get() through the per-edge SPSC mailbox (_ipc_ring.IpcRing)
+# instead of a per-transfer /dev/shm round-trip. Small payloads (< inline_threshold_bytes)
+# ride inline in the ring; big ones use the pool + D2D (descriptor in the ring); overflow /
+# ring-full / abort fall back to /dev/shm (read via _try_get_shm_compat).
 #
 # Usage:
-#   CUDA_VISIBLE_DEVICES=0,1 vllm-omni serve <model-path> --omni \
+#   CUDA_VISIBLE_DEVICES=0,1,2 vllm serve <model> --omni \
 #       --deploy-config vllm_omni/deploy/qwen3_omni_moe_cuda_ipc.yaml
 #
 async_chunk: true
@@ -17,8 +16,16 @@ connectors:
     name: CudaIPCConnector
     extra:
       tensor_lifetime_sec: 30.0
-      pool_size_mb: 512
-      pool_credits: 256
+      # Ring mode: small chunks go INLINE (no pool credit), so the pool ONLY holds the
+      # big prefill handoff (~16MB for input 4000, ~4KB/token).
+      pool_size_mb: 1536
+      pool_credits: 32
+      prewarm: false
+      inline_threshold_bytes: 16384   # < 16KB -> inline (no credit/pool/D2D)
+      ring_body_max: 131072           # 128KB: holds inline small payloads AND pool
+      # 2048 slots x 128KB = 256MB host shm per ring — absorbs the lag.
+      ring_entries: 2048
+      initial_codec_chunk_frames: 4
       codec_chunk_frames: 25
       codec_left_context_frames: 25
 
@@ -53,13 +60,13 @@ stages:
   - stage_id: 2
     max_num_batched_tokens: 65536
     max_num_seqs: 64
-    gpu_memory_utilization: 0.1
+    gpu_memory_utilization: 0.5
     enforce_eager: false
     trust_remote_code: true
     enable_prefix_caching: false
     enable_chunked_prefill: false
     async_scheduling: false
-    devices: "1"
+    devices: "2"
     input_connectors:
       from_stage_1: connector_of_cuda_ipc
     default_sampling_params:
