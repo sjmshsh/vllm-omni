@@ -17,9 +17,29 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTran
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, stage_connector_extra
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_stage_connector_extra_shapes():
+    """stage_connector_config readers (codec frame config etc.) must resolve ``extra`` from
+    BOTH the legacy ``{name,extra}`` shape and the dual ``{input/output:{...}}`` shape. A
+    single-direction stage (e.g. code2wav, input-only) is the regression case: its config is
+    ``{"input": {...}}`` with no top-level ``extra``, which the old readers silently dropped."""
+    codec = {"codec_chunk_frames": 25, "codec_left_context_frames": 25}
+    # legacy
+    assert stage_connector_extra({"name": "X", "extra": codec}) == codec
+    # single-direction (the dropped-codec-config regression)
+    assert stage_connector_extra({"input": {"name": "A", "extra": codec}}) == codec
+    assert stage_connector_extra({"output": {"name": "B", "extra": codec}}) == codec
+    # dual: extras merged
+    assert stage_connector_extra(
+        {"input": {"name": "A", "extra": codec}, "output": {"name": "B", "extra": {"k": 1}}}
+    ) == {**codec, "k": 1}
+    # tolerant of object / None / non-dict
+    assert stage_connector_extra(SimpleNamespace(extra=codec)) == codec
+    assert stage_connector_extra(None) == {} and stage_connector_extra({"name": "X"}) == {}
 
 
 class DummyWaitingQueue(list):

@@ -625,6 +625,8 @@ class CudaIPCConnector(OmniConnectorBase):
         try:
             self._board.buf[slot_offset // self._slot_size] = 0
             slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
+            # Order the pack after the producer's writes. record() captures the AMBIENT stream
+            # (default — no PTDS in current wheels); correct only while the producer writes there.
             self._compute_event.record()
             self._copy_stream.wait_event(self._compute_event)
             try:
@@ -950,7 +952,7 @@ class CudaIPCConnector(OmniConnectorBase):
             logger.warning("%s failed: %s", label, e)
 
     def close(self) -> None:
-        if self._closed:
+        if getattr(self, "_closed", True):
             return
         self._closed = True
         logger.info("Closing CudaIPCConnector...")

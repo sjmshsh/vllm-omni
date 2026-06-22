@@ -843,7 +843,8 @@ def talker2code2wav_async_chunk(
     if not code_predictor_codes.any():
         return None
 
-    connector = getattr(transfer_manager, "connector", None)
+    # Send edge (talker -> code2wav): codec sizing comes from the OUTPUT connector's config.
+    connector = getattr(transfer_manager, "output_connector", None) or getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size_config = int(cfg.get("codec_chunk_frames", 25))

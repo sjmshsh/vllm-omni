@@ -245,7 +245,15 @@ class OmniEngineArgs(EngineArgs):
                 sub = spec.get(direction)
                 if isinstance(sub, dict) and sub:
                     cfg[direction] = _with_stage_id(sub)
-            return cfg or {"name": "SharedMemoryConnector", "extra": {"stage_id": stage_id}}
+            if not cfg:
+                return {"name": "SharedMemoryConnector", "extra": {"stage_id": stage_id}}
+            # Backward-compat: legacy readers do connector_cfg.get("extra"); expose a merged
+            # top-level name/extra so they keep working on the dual shape (no per-model change).
+            from vllm_omni.distributed.omni_connectors.utils.config import stage_connector_extra
+
+            cfg["extra"] = stage_connector_extra(cfg)
+            cfg["name"] = (cfg.get("output") or cfg.get("input")).get("name", "SharedMemoryConnector")
+            return cfg
 
         cfg = _with_stage_id(spec)
         return cfg

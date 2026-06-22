@@ -25,6 +25,26 @@ class ConnectorSpec:
     extra: dict[str, Any] = field(default_factory=dict)  # backend-specific config
 
 
+def stage_connector_extra(connector_cfg: Any) -> dict[str, Any]:
+    """Extract the connector ``extra`` from a stage_connector_config of either shape:
+    legacy ``{"name","extra"}`` or dual ``{"input":{...},"output":{...}}`` (extras merged).
+    Tolerates a non-dict (object with ``.extra``) and missing keys; returns ``{}`` if absent."""
+    if connector_cfg is None:
+        return {}
+    if not isinstance(connector_cfg, dict):
+        extra = getattr(connector_cfg, "extra", None)
+        return extra if isinstance(extra, dict) else {}
+    if "input" in connector_cfg or "output" in connector_cfg:
+        merged: dict[str, Any] = {}
+        for direction in ("input", "output"):
+            sub = connector_cfg.get(direction)
+            if isinstance(sub, dict) and isinstance(sub.get("extra"), dict):
+                merged.update(sub["extra"])
+        return merged
+    extra = connector_cfg.get("extra")
+    return extra if isinstance(extra, dict) else {}
+
+
 @dataclass
 class OmniTransferConfig:
     """
