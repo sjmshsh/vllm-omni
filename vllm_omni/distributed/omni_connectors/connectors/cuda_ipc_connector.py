@@ -270,8 +270,7 @@ class CudaIPCConnector(OmniConnectorBase):
             )
             self._ring.write_header(self._ring_header_blob())
         else:
-            # Receiver, OR a non-transfer-rank sender (inert: never transmits). No GPU pool,
-            # board or ring — sender-only attrs are left unset and never read on this path.
+            # Receiver, OR an inert non-transfer-rank sender. No pool/board/ring.
             self._pool = None
             self._pool_handle = None
             self._credit_queue = None
@@ -279,12 +278,16 @@ class CudaIPCConnector(OmniConnectorBase):
             self._fallback_segs = {}
             self._board_name = None
             self._board = None
-            _NUM_RECV_STREAMS = 8
-            with torch.cuda.device(self.local_device):
-                self._recv_copy_streams = [
-                    torch.cuda.Stream(device=self.local_device) for _ in range(_NUM_RECV_STREAMS)
-                ]
-                self._recv_copy_events = [torch.cuda.Event() for _ in range(_NUM_RECV_STREAMS)]
+            if self.role == "receiver":
+                _NUM_RECV_STREAMS = 8
+                with torch.cuda.device(self.local_device):
+                    self._recv_copy_streams = [
+                        torch.cuda.Stream(device=self.local_device) for _ in range(_NUM_RECV_STREAMS)
+                    ]
+                    self._recv_copy_events = [torch.cuda.Event() for _ in range(_NUM_RECV_STREAMS)]
+            else:
+                self._recv_copy_streams = []
+                self._recv_copy_events = []
             self._recv_stream_idx = 0
 
         # Receiver: cache opened pool IPC mappings / sender release boards / IPC events
@@ -304,6 +307,7 @@ class CudaIPCConnector(OmniConnectorBase):
         logger.info(
             f"CudaIPCConnector initialized: role={self.role}, "
             f"local_device={self.local_device}, "
+            f"deployment_id={self._deployment_id}, replica_id={self._replica_id}, "
             f"pool={pool_size_mb}MB ({pool_credits} credits × {self._slot_size // 1024 // 1024}MB slots), "
             f"config_keys={sorted(config.keys())}"
         )
@@ -501,6 +505,9 @@ class CudaIPCConnector(OmniConnectorBase):
     ) -> tuple[bool, int, dict[str, Any] | None]:
         if self._closed:
             return False, 0, None
+        if not self._is_transfer_rank:
+            # Inert non-transfer-rank sender: no ring/pool. Guard against a stray call.
+            return False, 0, None
 
         composite_key = f"{put_key}@{from_stage}_{to_stage}"
         return self._put_ring(from_stage, to_stage, put_key, composite_key, data)
@@ -540,10 +547,10 @@ class CudaIPCConnector(OmniConnectorBase):
     # ------------------------------------------------------------------
 
     def _ring_name(self, from_stage, to_stage) -> str:
-        # Keyed by deployment_id (co-located service isolation) + stage edge + replica_id
-        # (same-host multi-replica). Assumes aligned 1:1 stage replicas (from_replica ==
-        # to_replica == replica_id); non-aligned routing would need explicit from/to replica.
-        return f"cudaipc_{self._deployment_id}_s{from_stage}_s{to_stage}_r{self._replica_id}"
+        # Hash the edge identity — deployment_id may carry chars invalid/unsafe for a POSIX
+        # shm name. Aligned 1:1 replicas (from_replica == to_replica == replica_id).
+        raw = f"{self._deployment_id}:{from_stage}:{to_stage}:{self._replica_id}"
+        return f"cudaipc_{hashlib.sha1(raw.encode()).hexdigest()[:20]}"
 
     @staticmethod
     def _key_hash16(composite_key: str) -> bytes:

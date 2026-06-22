@@ -78,7 +78,11 @@ class CudaIpcControlRing:
     def create(cls, name, n_slots, body_max, header_bytes=0):
         size = 8 + header_bytes + n_slots * (_OFF_BODY + body_max)
         try:
-            shm_pkg.SharedMemory(name=name).unlink()
+            old = shm_pkg.SharedMemory(name=name)
+            try:
+                old.unlink()
+            finally:
+                old.close()
         except FileNotFoundError:
             pass
         shm = shm_pkg.SharedMemory(create=True, size=size, name=name)

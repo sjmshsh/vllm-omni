@@ -142,21 +142,22 @@ def test_ring_ttl_zero_never_reclaims(ring):
 
 
 def test_ring_name_isolates_deployment_and_replica():
-    """The /dev/shm ring name must be unique per (deployment_id, edge, replica_id) so
-    co-located services and same-host replicas don't unlink each other's rings. Built via
-    object.__new__ to exercise the pure naming formula without a GPU."""
+    """Ring shm name must be deterministic, unique per (deployment_id, edge, replica_id), and
+    a valid POSIX shm name (hashed) even when deployment_id carries unsafe/long chars."""
     from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import CudaIPCConnector
 
-    c = object.__new__(CudaIPCConnector)
-    c._deployment_id, c._replica_id = "dep7", 0
-    assert c._ring_name("0", "1") == "cudaipc_dep7_s0_s1_r0"
-    # int stage (sender side) and str stage (receiver side) must format identically.
-    assert c._ring_name(0, 1) == c._ring_name("0", "1")
-    # replica_id and deployment_id each make the name distinct.
-    c._replica_id = 3
-    assert c._ring_name("0", "1") == "cudaipc_dep7_s0_s1_r3"
-    c._deployment_id = "depZ"
-    assert c._ring_name("0", "1") == "cudaipc_depZ_s0_s1_r3"
+    def name(dep, rid, a, b):
+        c = object.__new__(CudaIPCConnector)
+        c._deployment_id, c._replica_id = dep, rid
+        return c._ring_name(a, b)
+
+    base = name("dep7", 0, "0", "1")
+    assert name("dep7", 0, 0, 1) == base  # int (sender) / str (receiver) stage agree
+    assert name("dep7", 3, "0", "1") != base  # replica-unique
+    assert name("depZ", 0, "0", "1") != base  # deployment-unique
+    assert name("dep7", 0, "1", "2") != base  # edge-unique
+    nasty = name("a/b c:δ" * 40, 0, "0", "1")  # unsafe + long deployment_id
+    assert "/" not in nasty and " " not in nasty and len(nasty) < 40
 
 
 # ════════════════════════════════════════════════════════════════════
