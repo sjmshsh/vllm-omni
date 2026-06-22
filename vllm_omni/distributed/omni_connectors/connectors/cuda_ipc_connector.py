@@ -10,8 +10,9 @@ Architecture:
     acquires a slot, copies tensors into it, and releases it on ACK.
   - The receiver opens the pool IPC handle once (cached), reads from offsets.
     No per-tensor cudaIpcOpenMemHandle / cudaIpcCloseMemHandle.
-  - Control plane: tensor layout metadata serialized via /dev/shm, same as
-    before (< 1 KB per chunk).
+  - Control plane: a per-edge SPSC keyed mailbox ring (``IpcRing`` below) carries
+    small payloads inline and big-payload pool descriptors, opened once per edge —
+    replacing the per-transfer /dev/shm round-trip.
 
 CUDA-graph compatibility:
   - Both sender and receiver use dedicated non-blocking copy streams
@@ -75,8 +76,8 @@ _CREDIT_POLL_SEC = 0.0005  # poll interval within the reclaim window
 _RELEASE_FAST_INTERVAL_SEC = 0.001  # board-reclaim thread fast tick
 _RELEASE_TTL_EVERY_N_TICKS = 20  # TTL sweep runs every N fast ticks
 
-# Ring control plane (P1.2). Header carries the edge-constant pool/event/board handles
-# once: pool_handle(64) + event_handle(64) + board_name_len(1) + board_name(<=63).
+# Ring header carries the edge-constant pool/event/board handles once:
+# pool_handle(64) + event_handle(64) + board_name_len(1) + board_name(<=63).
 _RING_HEADER_BYTES = 256
 _RING_PCLASS_INLINE = 0
 _RING_PCLASS_POOL = 1
@@ -307,10 +308,6 @@ class CudaIPCConnector(OmniConnectorBase):
         if self.role not in {"sender", "receiver"}:
             raise ValueError(f"Invalid role={self.role!r}. Expected 'sender' or 'receiver'.")
         self.tensor_lifetime_sec = float(config.get("tensor_lifetime_sec", 30.0))
-        # Pre-warm: receiver opens the sender's static pool/event IPC handles at
-        # startup (via a published advert) instead of lazily on the first get(),
-        # moving the ~14 ms cudaIpcOpenMemHandle cold start off the TTFA path.
-        self._prewarm = bool(config.get("prewarm", False))
         # Ring control plane: put()/get() route through a pre-allocated per-edge SPSC
         # mailbox (see ``IpcRing`` above); small payloads ride inline, big ones use the
         # pool + D2D. /dev/shm remains only as the overflow/ring-full/abort fallback.
@@ -332,7 +329,6 @@ class CudaIPCConnector(OmniConnectorBase):
         self._open_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._release_thread: threading.Thread | None = None
-        self._prewarm_thread: threading.Thread | None = None
         self._shm_compat_decode_failures: dict[str, int] = {}
 
         self._metrics = {
@@ -400,8 +396,6 @@ class CudaIPCConnector(OmniConnectorBase):
             self._board_name = f"cudaipc_board_{uuid.uuid4().hex[:16]}"
             self._board = shm_pkg.SharedMemory(create=True, size=pool_credits, name=self._board_name)
             self._board.buf[:pool_credits] = bytes(pool_credits)
-            if self._prewarm:
-                self._publish_handle_advert()
             n_slots = self._ring_entries_cfg or max(64, pool_credits * 4)
             body_max = max(self._ring_body_max, self._inline_threshold)
             self._ring = IpcRing.create(
@@ -439,9 +433,6 @@ class CudaIPCConnector(OmniConnectorBase):
                 target=self._release_loop, daemon=True, name="cuda-ipc-release-loop"
             )
             self._release_thread.start()
-        elif self._prewarm:
-            self._prewarm_thread = threading.Thread(target=self._prewarm_loop, daemon=True, name="cuda-ipc-prewarm")
-            self._prewarm_thread.start()
 
         logger.info(
             f"CudaIPCConnector initialized: role={self.role}, "
@@ -632,63 +623,6 @@ class CudaIPCConnector(OmniConnectorBase):
             return self._opened_events[handle_bytes]
 
     # ------------------------------------------------------------------
-    # Handle pre-warm (S2): kill the first-get cudaIpcOpenMemHandle cold start
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _advert_name(stage_id: int) -> str:
-        """Deterministic /dev/shm name where stage ``stage_id``'s sender
-        publishes its static pool + IPC-event handles for receiver pre-warm."""
-        return f"cudaipc_advert_s{stage_id}"
-
-    def _publish_handle_advert(self) -> None:
-        """Sender: publish the (static, lifetime-stable) pool and IPC-event
-        handles to a well-known SHM key so the downstream receiver can open them
-        once at startup. Best-effort; failure just leaves the receiver on the
-        lazy-open path."""
-        try:
-            blob = OmniSerializer.serialize(
-                {"pool_handle": self._pool_handle, "event_handle": self._ipc_event_handle_bytes}
-            )
-            self._atomic_shm_write(blob, name=self._advert_name(self.stage_id))
-        except Exception as e:
-            logger.warning("CudaIPCConnector handle advert publish failed: %s", e)
-
-    def _prewarm_loop(self) -> None:
-        """Receiver: best-effort one-shot warm-up. Wait for the upstream
-        sender's handle advert, then open + cache the pool and IPC-event handles
-        so the first real ``get()`` is a cache hit (no cold cudaIpcOpenMemHandle
-        on the TTFA path). A miss/timeout is harmless — the lazy open in
-        ``_get_ring`` still works."""
-        advert = self._advert_name(self.stage_id - 1)
-        deadline = _time_mod.monotonic() + 30.0
-        while not self._stop_event.is_set() and _time_mod.monotonic() < deadline:
-            try:
-                seg = shm_pkg.SharedMemory(name=advert)
-            except FileNotFoundError:
-                self._stop_event.wait(timeout=0.05)
-                continue
-            try:
-                blob = bytes(seg.buf[: seg.size])
-            finally:
-                seg.close()
-                try:
-                    from multiprocessing.resource_tracker import unregister
-
-                    unregister(f"/{advert}", "shared_memory")
-                except Exception:
-                    pass
-            try:
-                info = OmniSerializer.deserialize(blob)
-                with torch.cuda.device(self.local_device):
-                    self._open_pool(info["pool_handle"])
-                    self._open_ipc_event(info["event_handle"])
-                logger.info("CudaIPCConnector receiver pre-warmed IPC handles from %s", advert)
-            except Exception as e:
-                logger.warning("CudaIPCConnector pre-warm failed (%s); using lazy open.", e)
-            return
-
-    # ------------------------------------------------------------------
     # Pool-based encode / decode
     # ------------------------------------------------------------------
 
@@ -825,7 +759,7 @@ class CudaIPCConnector(OmniConnectorBase):
         return True, size, {"shm": meta, "size": size, "cpu_fallback": True}
 
     # ------------------------------------------------------------------
-    # Ring control plane (P1.2) — put/get over the per-edge SPSC mailbox.
+    # Ring control plane — put/get over the per-edge SPSC mailbox.
     # The only transport path; replaces the per-transfer /dev/shm round-trip.
     # ------------------------------------------------------------------
 
@@ -1285,8 +1219,6 @@ class CudaIPCConnector(OmniConnectorBase):
         self._stop_event.set()
         if self._release_thread is not None and self._release_thread.is_alive():
             self._release_thread.join(timeout=1.0)
-        if self._prewarm_thread is not None and self._prewarm_thread.is_alive():
-            self._prewarm_thread.join(timeout=1.0)
 
         with self._held_lock:
             self._held_credits.clear()
@@ -1321,16 +1253,6 @@ class CudaIPCConnector(OmniConnectorBase):
         if getattr(self, "_fallback_segs", None) is not None:
             self._fallback_segs.clear()
 
-        # Unlink the published handle advert (sender, pre-warm).
-        if self.role == "sender" and self._prewarm:
-            try:
-                seg = shm_pkg.SharedMemory(name=self._advert_name(self.stage_id))
-                seg.close()
-                seg.unlink()
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                logger.warning("Failed to unlink handle advert: %s", e)
         for board in self._opened_boards.values():
             try:
                 board.close()
@@ -1338,7 +1260,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 pass
         self._opened_boards.clear()
 
-        # Ring control plane (P1.2): sender unlinks its ring; receiver closes opens.
+        # Ring control plane: sender unlinks its ring; receiver closes opens.
         if self._ring is not None:
             self._ring.close()  # owner -> unlinks
             self._ring = None

@@ -122,7 +122,7 @@ def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, ex
 
 _DUAL_CFG = {
     "input": {"name": "SharedMemoryConnector"},
-    "output": {"name": "CudaIPCConnector", "extra": {"use_ring": True}},
+    "output": {"name": "CudaIPCConnector", "extra": {"pool_size_mb": 256}},
 }
 
 
@@ -133,7 +133,7 @@ _DUAL_CFG = {
         # SHM, the output (send) edge gets CudaIPC — the mixed setup where the capability
         # check on the send path must read from `output_connector`, not the shared one.
         (_DUAL_CFG, "input", ("SharedMemoryConnector", {})),
-        (_DUAL_CFG, "output", ("CudaIPCConnector", {"use_ring": True})),
+        (_DUAL_CFG, "output", ("CudaIPCConnector", {"pool_size_mb": 256})),
         # A direction that is not configured returns None (and never calls the factory).
         ({"input": {"name": "SharedMemoryConnector"}}, "output", None),
         ({"output": {"name": "CudaIPCConnector"}}, "input", None),

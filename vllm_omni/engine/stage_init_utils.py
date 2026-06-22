@@ -1055,9 +1055,8 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
 def get_stage_connector_spec(
     omni_transfer_config: Any,
     stage_id: int,
-    async_chunk: bool,
 ) -> dict[str, Any]:
-    """Return stage connector spec for async chunking.
+    """Return the resolved stage connector spec (mode-independent).
 
     Legacy format:
         {"name": "...", "extra": {...}}
@@ -1067,14 +1066,14 @@ def get_stage_connector_spec(
             "input":  {"name": "...", "extra": {...}},
             "output": {"name": "...", "extra": {...}},
         }
+
+    NOT gated on async_chunk: full_payload mode (async_chunk=false) also uses
+    ``self._output_connector`` in ``send_full_payload_outputs``, so it must honor
+    the configured connector (e.g. CudaIPC). Unconfigured edges still fall back to
+    the SharedMemoryConnector default via the ``not stage_connectors_cfg`` guard.
     """
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
 
-    # NOTE: do NOT early-return on ``not async_chunk``. full_payload mode
-    # (async_chunk=false) still uses ``self._output_connector`` in
-    # ``send_full_payload_outputs``, so it must honor the configured connector
-    # (e.g. CudaIPC) for the edge. The ``not stage_connectors_cfg`` guard below
-    # already preserves the SharedMemoryConnector default for unconfigured edges.
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     if not stage_connectors_cfg:
         return {}
