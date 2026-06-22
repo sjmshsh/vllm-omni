@@ -4,9 +4,9 @@
 
 Two layers, gated independently:
 
-1. ``IpcRing`` (the lock-free SPSC keyed-mailbox control plane in ``_ipc_ring.py``):
-   pure-Python, NO CUDA — these tests run anywhere, incl. CPU-only CI. The module is
-   loaded by file path so importing it does not pull in the vllm_omni package (torch/vllm).
+1. ``IpcRing`` (the lock-free SPSC keyed-mailbox control plane defined in
+   ``cuda_ipc_connector.py``): pure-Python, NO CUDA — these tests run anywhere a CPU
+   torch import works, incl. CPU-only CI.
 
 2. ``CudaIPCConnector`` functional put/get: requires a real GPU. CUDA IPC handles cannot be
    opened in the same process that created them, so these spawn sender + receiver processes.
@@ -16,9 +16,7 @@ Two layers, gated independently:
 
 from __future__ import annotations
 
-import importlib.util
 import multiprocessing as mp
-import os
 import uuid
 from typing import Any
 
@@ -33,22 +31,10 @@ import torch
 # separately exercised by tests/dfx/perf/ipc_ring_soak.py (the real deployment shape).
 # NOTE: same-process re-open() of a SharedMemory segment is not coherent on macOS, so these
 # poll from the producing ring object directly.
-
-_RING_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "..",
-    "..",
-    "vllm_omni",
-    "distributed",
-    "omni_connectors",
-    "connectors",
-    "_ipc_ring.py",
+from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import (
+    IpcRing,
+    RingFullError,
 )
-_spec = importlib.util.spec_from_file_location("_ipc_ring_under_test", _RING_PATH)
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
-IpcRing, RingFull = _mod.IpcRing, _mod.RingFull
 
 
 def _kh(s: str) -> bytes:
@@ -128,7 +114,7 @@ def test_ring_open_addressed_collision(ring):
 def test_ring_full_raises(ring):
     for i in range(8):  # fill all 8 slots without consuming
         ring.publish(_kh(f"fill-{i}"), 0, b"z")
-    with pytest.raises(RingFull):
+    with pytest.raises(RingFullError):
         ring.publish(_kh("one-too-many"), 0, b"z")
 
 
@@ -142,7 +128,7 @@ def test_ring_ttl_reclaims_stale_entry(ring):
     aborted/never-polled request cannot wedge the ring. Fresh entries are NOT reclaimed."""
     for i in range(8):  # fill at t=100, never consumed
         ring.publish(_kh(f"stale-{i}"), 0, b"old", ts=100, ttl_sec=30)
-    with pytest.raises(RingFull):  # t=110 within ttl -> still full
+    with pytest.raises(RingFullError):  # t=110 within ttl -> still full
         ring.publish(_kh("fresh"), 0, b"new", ts=110, ttl_sec=30)
     # t=200: the t=100 entries are stale (>30s) -> reclaimed in place, publish succeeds
     ring.publish(_kh("after-ttl"), 0, b"new", ts=200, ttl_sec=30)
@@ -152,7 +138,7 @@ def test_ring_ttl_zero_never_reclaims(ring):
     """ttl_sec=0 disables reclaim — full ring stays full regardless of ts."""
     for i in range(8):
         ring.publish(_kh(f"x-{i}"), 0, b"o", ts=100, ttl_sec=0)
-    with pytest.raises(RingFull):
+    with pytest.raises(RingFullError):
         ring.publish(_kh("y"), 0, b"n", ts=999999, ttl_sec=0)
 
 
