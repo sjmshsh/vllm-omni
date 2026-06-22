@@ -73,6 +73,11 @@ class CudaIpcControlRing:
         self._pubctr = 0
         self._owner = owner  # sender created it (responsible for unlink)
 
+    @property
+    def body_max(self) -> int:
+        """Max body bytes per slot (callers route oversize payloads to a fallback)."""
+        return self._body_max
+
     # ---- construction -------------------------------------------------
     @classmethod
     def create(cls, name, n_slots, body_max, header_bytes=0):

@@ -108,3 +108,23 @@ def load_cudart():
     lib.cudaEventDestroy.restype = ctypes.c_int
 
     return lib
+
+
+# Thin call wrappers — keep the ctypes.c_void_p/c_size_t boxing and the ret!=0 raise out of
+# the connector's hot path.
+def memcpy_async_d2d(lib, dst: int, src: int, nbytes: int, stream: int) -> None:
+    ret = lib.cudaMemcpyAsync(
+        ctypes.c_void_p(dst),
+        ctypes.c_void_p(src),
+        ctypes.c_size_t(nbytes),
+        ctypes.c_int(_CUDA_MEMCPY_D2D),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        raise RuntimeError(f"cudaMemcpyAsync (D2D) failed: {ret}")
+
+
+def stream_wait_event(lib, stream: int, event) -> None:
+    ret = lib.cudaStreamWaitEvent(ctypes.c_void_p(stream), event, ctypes.c_uint(0))
+    if ret != 0:
+        raise RuntimeError(f"cudaStreamWaitEvent failed: {ret}")

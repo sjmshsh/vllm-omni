@@ -15,6 +15,10 @@
   (sender after pack-D2D, receiver after the pool-read D2D) — no async use-after-free.
 - Fallback: on credit/ring exhaustion or payload overflow, put() degrades to CPU
   serialization via /dev/shm (SharedMemoryConnector wire format); never blocks.
+
+Limitation: no sender live-restart. The receiver caches the sender's opened IPC pool/event
+handles, so if the sender process restarts (new handles) the receiver will not self-heal —
+restart the whole edge. Targets static, co-launched stage processes.
 """
 
 import ctypes
@@ -26,6 +30,7 @@ import time as _time_mod
 import uuid
 from dataclasses import dataclass
 from multiprocessing import shared_memory as shm_pkg
+from multiprocessing.resource_tracker import unregister
 from typing import Any
 
 import torch
@@ -39,10 +44,11 @@ from .cuda_ipc_control_ring import CudaIpcControlRing, RingFullError, untrack_sh
 from .cuda_ipc_runtime import (
     _CUDA_EVENT_DISABLE_TIMING,
     _CUDA_EVENT_INTERPROCESS,
-    _CUDA_MEMCPY_D2D,
     _CudaIpcEventHandle,
     _CudaIpcMemHandle,
     load_cudart,
+    memcpy_async_d2d,
+    stream_wait_event,
 )
 
 logger = get_connector_logger(__name__)
@@ -57,6 +63,7 @@ _POOL_ALIGNMENT = 16  # bytes, for GPU copy efficiency
 # Explicit extra config values override auto-sizing.
 _DEFAULT_POOL_SIZE_MB = 128
 _DEFAULT_POOL_CREDITS = 64
+_DEFAULT_RECV_STREAMS = 8  # receiver D2D copy streams (round-robined per get)
 
 # Timing constants — overridable via extra config keys of the same name
 # (without leading underscore), e.g. ``"credit_wait_sec": 0.01``.
@@ -151,6 +158,35 @@ class CudaIPCConnector(OmniConnectorBase):
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
+        self._parse_config(config)
+        self._init_runtime_state()
+        self._init_cuda()
+        if self._is_sender_owner:
+            self._init_sender_resources()
+        else:
+            self._init_inert_state()
+        if self._is_sender_owner:
+            self._start_release_thread()
+        logger.info(
+            "CudaIPCConnector initialized: role=%s, local_device=%s, deployment_id=%s, "
+            "replica_id=%s, pool=%dMB (%d credits x %dMB slots)",
+            self.role,
+            self.local_device,
+            self._deployment_id,
+            self._replica_id,
+            self._pool_size // (1024 * 1024),
+            self._pool_credits,
+            self._slot_size // 1024 // 1024,
+        )
+        logger.debug("CudaIPCConnector config_keys=%s", sorted(config.keys()))
+
+    @property
+    def _is_sender_owner(self) -> bool:
+        """The sender's data-transfer rank — the only one that owns a pool/board/ring."""
+        return self.role == "sender" and self._is_transfer_rank
+
+    def _parse_config(self, config: dict[str, Any]) -> None:
+        """Resolve role, edge identity, thresholds, timing, and pool sizing."""
         self.stage_id = int(config.get("stage_id", -1))
         self.role = str(config.get("role", "sender")).lower()
         if self.role not in {"sender", "receiver"}:
@@ -175,26 +211,42 @@ class CudaIPCConnector(OmniConnectorBase):
         # TP>1: only the data-transfer rank owns the per-edge ring (non-transfer ranks never
         # transmit, so must not create a same-named ring). Injected by the stage worker.
         self._is_transfer_rank = bool(config.get("is_transfer_rank", True))
-        # Ring control plane: put()/get() route through the per-edge SPSC mailbox; small
-        # payloads inline, big ones via pool+D2D; /dev/shm only as overflow/abort fallback.
         self._inline_threshold = int(config.get("inline_threshold_bytes", 16384))
         self._ring_entries_cfg = int(config.get("ring_entries", 0))  # 0 => auto from credits
-        # Slot body holds the larger of an inline payload or a pool descriptor (CPU-side
-        # token-ids, ~40KB@in4000); an oversize descriptor degrades to CPU fallback.
         self._ring_body_max = int(config.get("ring_body_max", 524288))
-        self._ring: CudaIpcControlRing | None = None  # sender: created at init; receiver: None
-        self._opened_rings: dict[tuple[str, str], CudaIpcControlRing] = {}  # receiver cache
-        self._ring_edge_handles: dict[tuple[str, str], tuple[bytes, bytes, str]] = {}
         self.local_device = self._resolve_local_device(config.get("local_device", "auto"))
+        # Pool sizing: auto from max_num_seqs unless overridden.
+        max_num_seqs = int(config.get("max_num_seqs", 0))
+        if max_num_seqs > 0 and "pool_credits" not in config:
+            auto_credits = max(64, max_num_seqs * 4)
+            auto_size_mb = auto_credits * 2
+        else:
+            auto_credits = _DEFAULT_POOL_CREDITS
+            auto_size_mb = _DEFAULT_POOL_SIZE_MB
+        self._pool_credits = int(config.get("pool_credits", auto_credits))
+        self._pool_size = int(config.get("pool_size_mb", auto_size_mb)) * 1024 * 1024
+        self._slot_size = self._pool_size // self._pool_credits
+        # Timing overrides via extra config.
+        self._credit_wait_sec = float(config.get("credit_wait_sec", _CREDIT_WAIT_SEC))
+        self._credit_poll_sec = float(config.get("credit_poll_sec", _CREDIT_POLL_SEC))
+        self._release_interval_sec = float(config.get("release_fast_interval_sec", _RELEASE_FAST_INTERVAL_SEC))
+        self._release_ttl_every = int(config.get("release_ttl_every_n_ticks", _RELEASE_TTL_EVERY_N_TICKS))
+
+    def _init_runtime_state(self) -> None:
+        """Locks, ring/receiver caches, metrics, lifecycle flags."""
+        self._ring: CudaIpcControlRing | None = None
+        self._opened_rings: dict[tuple[str, str], CudaIpcControlRing] = {}
+        self._ring_edge_handles: dict[tuple[str, str], tuple[bytes, bytes, str]] = {}
+        self._opened_pools: dict[bytes, ctypes.c_void_p] = {}
+        self._opened_boards: dict[str, shm_pkg.SharedMemory] = {}
+        self._opened_events: dict[bytes, ctypes.c_void_p] = {}
         self._closed = False
         self._cudart = None
-
         self._held_lock = threading.Lock()
         self._open_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._release_thread: threading.Thread | None = None
         self._shm_compat_decode_failures: dict[str, int] = {}
-
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -204,113 +256,82 @@ class CudaIPCConnector(OmniConnectorBase):
             "ttl_releases": 0,
             "errors": 0,
             "cpu_fallbacks": 0,
+            # per-reason breakdown so ops can see WHY fallbacks spike without grepping logs
+            "fallback_ring_full": 0,
+            "fallback_credits_exhausted": 0,
+            "fallback_slot_overflow": 0,
+            "fallback_descriptor_too_big": 0,
+            "fallback_inline_too_big": 0,
         }
 
+    def _init_cuda(self) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("CudaIPCConnector requires CUDA runtime.")
         self._cudart = load_cudart()
-
-        # --- Memory pool (sender side) ---
-        # Auto-size from max_num_seqs when user omits explicit values.
-        max_num_seqs = int(config.get("max_num_seqs", 0))
-        if max_num_seqs > 0 and "pool_credits" not in config:
-            auto_credits = max(64, max_num_seqs * 4)
-            auto_size_mb = auto_credits * 2
-        else:
-            auto_credits = _DEFAULT_POOL_CREDITS
-            auto_size_mb = _DEFAULT_POOL_SIZE_MB
-        pool_size_mb = int(config.get("pool_size_mb", auto_size_mb))
-        pool_credits = int(config.get("pool_credits", auto_credits))
-
-        # Timing overrides via extra config.
-        self._credit_wait_sec = float(config.get("credit_wait_sec", _CREDIT_WAIT_SEC))
-        self._credit_poll_sec = float(config.get("credit_poll_sec", _CREDIT_POLL_SEC))
-        self._release_interval_sec = float(config.get("release_fast_interval_sec", _RELEASE_FAST_INTERVAL_SEC))
-        self._release_ttl_every = int(config.get("release_ttl_every_n_ticks", _RELEASE_TTL_EVERY_N_TICKS))
-        self._pool_size = pool_size_mb * 1024 * 1024
-        self._slot_size = self._pool_size // pool_credits
-        self._pool_credits = pool_credits
-
-        # Only the data-transfer rank allocates the sender pool/board/ring; non-transfer ranks
-        # never transmit, so allocating there wastes a full pool (and would collide).
-        if self.role == "sender" and self._is_transfer_rank:
-            with torch.cuda.device(self.local_device):
-                self._pool = torch.zeros(self._pool_size, dtype=torch.uint8, device=self.local_device)
-                self._copy_stream = torch.cuda.Stream(device=self.local_device)
-                self._compute_event = torch.cuda.Event()
-                self._copy_done_event = torch.cuda.Event()
-            self._pool_handle = self._get_ipc_handle(self._pool.data_ptr())
-            self._ipc_event = ctypes.c_void_p()
-            flags = ctypes.c_uint(_CUDA_EVENT_INTERPROCESS | _CUDA_EVENT_DISABLE_TIMING)
-            ret = self._cudart.cudaEventCreateWithFlags(ctypes.byref(self._ipc_event), flags)
-            if ret != 0:
-                raise RuntimeError(f"cudaEventCreateWithFlags failed: {ret}")
-            ipc_evt_handle = _CudaIpcEventHandle()
-            ret = self._cudart.cudaIpcGetEventHandle(ctypes.byref(ipc_evt_handle), self._ipc_event)
-            if ret != 0:
-                raise RuntimeError(f"cudaIpcGetEventHandle failed: {ret}")
-            self._ipc_event_handle_bytes = bytes(ipc_evt_handle)
-            self._credit_queue: _queue_mod.Queue[int] = _queue_mod.Queue(maxsize=pool_credits)
-            for i in range(pool_credits):
-                self._credit_queue.put_nowait(i * self._slot_size)
-            self._held_credits: dict[str, tuple[float, int]] = {}
-            # CPU-fallback /dev/shm segments {name: ts}: receiver unlinks on read, else the
-            # release loop TTL-sweeps them (the adapter never calls connector cleanup()).
-            self._fallback_segs: dict[str, float] = {}
-            self._board_name = f"cudaipc_board_{uuid.uuid4().hex[:16]}"
-            self._board = shm_pkg.SharedMemory(create=True, size=pool_credits, name=self._board_name)
-            self._board.buf[:pool_credits] = bytes(pool_credits)
-            n_slots = self._ring_entries_cfg or max(64, pool_credits * 4)
-            body_max = max(self._ring_body_max, self._inline_threshold)
-            self._ring = CudaIpcControlRing.create(
-                self._ring_name(self.stage_id, self.stage_id + 1),
-                n_slots,
-                body_max,
-                header_bytes=_RING_HEADER_BYTES,
-            )
-            self._ring.write_header(self._ring_header_blob())
-        else:
-            # Receiver, OR an inert non-transfer-rank sender. No pool/board/ring.
-            self._pool = None
-            self._pool_handle = None
-            self._credit_queue = None
-            self._held_credits = {}
-            self._fallback_segs = {}
-            self._board_name = None
-            self._board = None
-            if self.role == "receiver":
-                _NUM_RECV_STREAMS = 8
-                with torch.cuda.device(self.local_device):
-                    self._recv_copy_streams = [
-                        torch.cuda.Stream(device=self.local_device) for _ in range(_NUM_RECV_STREAMS)
-                    ]
-                    self._recv_copy_events = [torch.cuda.Event() for _ in range(_NUM_RECV_STREAMS)]
-            else:
-                self._recv_copy_streams = []
-                self._recv_copy_events = []
-            self._recv_stream_idx = 0
-
-        # Receiver: cache opened pool IPC mappings / sender release boards / IPC events
-        self._opened_pools: dict[bytes, ctypes.c_void_p] = {}
-        self._opened_boards: dict[str, shm_pkg.SharedMemory] = {}
-        self._opened_events: dict[bytes, ctypes.c_void_p] = {}
-
         if torch.accelerator.device_count() > 1:
             self._validate_p2p_access()
 
-        if self.role == "sender" and self._is_transfer_rank:
-            self._release_thread = threading.Thread(
-                target=self._release_loop, daemon=True, name="cuda-ipc-release-loop"
-            )
-            self._release_thread.start()
-
-        logger.info(
-            f"CudaIPCConnector initialized: role={self.role}, "
-            f"local_device={self.local_device}, "
-            f"deployment_id={self._deployment_id}, replica_id={self._replica_id}, "
-            f"pool={pool_size_mb}MB ({pool_credits} credits × {self._slot_size // 1024 // 1024}MB slots), "
-            f"config_keys={sorted(config.keys())}"
+    def _init_sender_resources(self) -> None:
+        """Sender data-transfer rank: GPU pool, IPC event, release board, per-edge ring."""
+        with torch.cuda.device(self.local_device):
+            self._pool = torch.zeros(self._pool_size, dtype=torch.uint8, device=self.local_device)
+            self._copy_stream = torch.cuda.Stream(device=self.local_device)
+            self._compute_event = torch.cuda.Event()
+            self._copy_done_event = torch.cuda.Event()
+        self._pool_handle = self._get_ipc_handle(self._pool.data_ptr())
+        self._ipc_event = ctypes.c_void_p()
+        flags = ctypes.c_uint(_CUDA_EVENT_INTERPROCESS | _CUDA_EVENT_DISABLE_TIMING)
+        ret = self._cudart.cudaEventCreateWithFlags(ctypes.byref(self._ipc_event), flags)
+        if ret != 0:
+            raise RuntimeError(f"cudaEventCreateWithFlags failed: {ret}")
+        ipc_evt_handle = _CudaIpcEventHandle()
+        ret = self._cudart.cudaIpcGetEventHandle(ctypes.byref(ipc_evt_handle), self._ipc_event)
+        if ret != 0:
+            raise RuntimeError(f"cudaIpcGetEventHandle failed: {ret}")
+        self._ipc_event_handle_bytes = bytes(ipc_evt_handle)
+        self._credit_queue: _queue_mod.Queue[int] = _queue_mod.Queue(maxsize=self._pool_credits)
+        for i in range(self._pool_credits):
+            self._credit_queue.put_nowait(i * self._slot_size)
+        self._held_credits: dict[str, tuple[float, int]] = {}
+        # CPU-fallback /dev/shm segments {name: ts}: receiver unlinks on read, else the
+        # release loop TTL-sweeps them (the adapter never calls connector cleanup()).
+        self._fallback_segs: dict[str, float] = {}
+        self._board_name = f"cudaipc_board_{uuid.uuid4().hex[:16]}"
+        self._board = shm_pkg.SharedMemory(create=True, size=self._pool_credits, name=self._board_name)
+        self._board.buf[: self._pool_credits] = bytes(self._pool_credits)
+        n_slots = self._ring_entries_cfg or max(64, self._pool_credits * 4)
+        body_max = max(self._ring_body_max, self._inline_threshold)
+        self._ring = CudaIpcControlRing.create(
+            self._ring_name(self.stage_id, self.stage_id + 1),
+            n_slots,
+            body_max,
+            header_bytes=_RING_HEADER_BYTES,
         )
+        self._ring.write_header(self._ring_header_blob())
+
+    def _init_inert_state(self) -> None:
+        """Receiver, or an inert non-transfer-rank sender: no pool/board/ring."""
+        self._pool = None
+        self._pool_handle = None
+        self._credit_queue = None
+        self._held_credits = {}
+        self._fallback_segs = {}
+        self._board_name = None
+        self._board = None
+        if self.role == "receiver":
+            with torch.cuda.device(self.local_device):
+                self._recv_copy_streams = [
+                    torch.cuda.Stream(device=self.local_device) for _ in range(_DEFAULT_RECV_STREAMS)
+                ]
+                self._recv_copy_events = [torch.cuda.Event() for _ in range(_DEFAULT_RECV_STREAMS)]
+        else:
+            self._recv_copy_streams = []
+            self._recv_copy_events = []
+        self._recv_stream_idx = 0
+
+    def _start_release_thread(self) -> None:
+        self._release_thread = threading.Thread(target=self._release_loop, daemon=True, name="cuda-ipc-release-loop")
+        self._release_thread.start()
 
     # ------------------------------------------------------------------
     # Device & naming helpers
@@ -337,8 +358,6 @@ class CudaIPCConnector(OmniConnectorBase):
     @staticmethod
     def _atomic_shm_write(payload: bytes, name: str) -> dict[str, Any]:
         """Write to SHM atomically: write to temp name, then rename."""
-        from multiprocessing.resource_tracker import unregister
-
         tmp_name = f"{name}__tmp"
         meta = shm_write_bytes(payload, name=tmp_name)
         os.rename(f"/dev/shm/{tmp_name}", f"/dev/shm/{name}")
@@ -433,6 +452,8 @@ class CudaIPCConnector(OmniConnectorBase):
         if isinstance(obj, tuple):
             return tuple(self._walk_encode_pool(v, slot) for v in obj)
         if hasattr(obj, "__struct_fields__"):
+            # Drop None struct fields — matches data_entry_keys.to_dict (the SHM/inline wire
+            # contract), so pool and SHM paths produce the same dict keys downstream.
             return {
                 f: self._walk_encode_pool(getattr(obj, f), slot)
                 for f in obj.__struct_fields__
@@ -461,16 +482,13 @@ class CudaIPCConnector(OmniConnectorBase):
         # cross-stream race at write time.
         with torch.cuda.stream(target_stream):
             dst = torch.empty(shape, dtype=dtype, device=self.local_device)
-        src = ctypes.c_void_p(pool_ptr.value + slot_offset + tensor_offset)
-        ret = self._cudart.cudaMemcpyAsync(
-            ctypes.c_void_p(dst.data_ptr()),
-            src,
-            ctypes.c_size_t(nbytes),
-            ctypes.c_int(_CUDA_MEMCPY_D2D),
-            ctypes.c_void_p(target_stream.cuda_stream),
+        memcpy_async_d2d(
+            self._cudart,
+            dst.data_ptr(),
+            pool_ptr.value + slot_offset + tensor_offset,
+            nbytes,
+            target_stream.cuda_stream,
         )
-        if ret != 0:
-            raise RuntimeError(f"cudaMemcpyAsync (pool decode) failed with code {ret}")
         # dst is consumed downstream on the model/default stream and may be cached across
         # steps; record it there so the allocator won't reuse its memory while that use is live.
         dst.record_stream(torch.cuda.current_stream(self.local_device))
@@ -512,7 +530,7 @@ class CudaIPCConnector(OmniConnectorBase):
             # Inert non-transfer-rank sender: no ring/pool. Guard against a stray call.
             return False, 0, None
 
-        composite_key = f"{put_key}@{from_stage}_{to_stage}"
+        composite_key = self._make_composite_key(put_key, from_stage, to_stage)
         return self._put_ring(from_stage, to_stage, put_key, composite_key, data)
 
     def _put_cpu_fallback(
@@ -532,6 +550,9 @@ class CudaIPCConnector(OmniConnectorBase):
             reason or "pool credits exhausted or slot overflow",
         )
         self._metrics["cpu_fallbacks"] += 1
+        # Categorize by the reason's leading token (ring_full / credits_exhausted / ...).
+        cat = f"fallback_{reason.split(maxsplit=1)[0]}" if reason else "fallback_other"
+        self._metrics[cat] = self._metrics.get(cat, 0) + 1
         payload = self.serialize_obj(data)
         size = len(payload)
 
@@ -554,6 +575,11 @@ class CudaIPCConnector(OmniConnectorBase):
         # shm name. Aligned 1:1 replicas (from_replica == to_replica == replica_id).
         raw = f"{self._deployment_id}:{from_stage}:{to_stage}:{self._replica_id}"
         return f"cudaipc_{hashlib.sha1(raw.encode()).hexdigest()[:20]}"
+
+    @staticmethod
+    def _make_composite_key(key: str, from_stage: str, to_stage: str) -> str:
+        """Per-edge composite key. Change here once if the wire format ever changes."""
+        return f"{key}@{from_stage}_{to_stage}"
 
     @staticmethod
     def _key_hash16(composite_key: str) -> bytes:
@@ -581,83 +607,51 @@ class CudaIPCConnector(OmniConnectorBase):
         try:
             kh = self._key_hash16(composite_key)
             if self._estimate_nbytes(data) < self._inline_threshold:
-                # INLINE: serialize (the cheap D2H for a tiny GPU tensor) -> ring body.
-                payload = self.serialize_obj(data)
-                if len(payload) > self._ring._body_max:
-                    return self._put_cpu_fallback(
-                        from_stage,
-                        to_stage,
-                        put_key,
-                        composite_key,
-                        data,
-                        reason=f"inline_too_big {len(payload)}",
-                    )
-                try:
-                    self._ring.publish(
-                        kh,
-                        _RING_PCLASS_INLINE,
-                        payload,
-                        ts=int(_time_mod.time()),
-                        ttl_sec=int(self.tensor_lifetime_sec),
-                    )
-                except RingFullError:
-                    return self._put_cpu_fallback(
-                        from_stage, to_stage, put_key, composite_key, data, reason="ring_full"
-                    )
-                self._metrics["puts"] += 1
-                self._metrics["bytes_transferred"] += len(payload)
-                return True, len(payload), {"ring": True, "size": len(payload)}
+                return self._put_inline(from_stage, to_stage, put_key, composite_key, data, kh)
+            return self._put_pool(from_stage, to_stage, put_key, composite_key, data, kh)
+        except Exception as e:
+            self._metrics["errors"] += 1
+            logger.error("CudaIPCConnector ring put failed for %s: %s", put_key, e, exc_info=True)
+            return False, 0, None
 
-            # POOL: acquire a credit, D2D-pack into the slot, then publish a small
-            # descriptor (slot_offset/slot_index + tensor layout) to the ring.
-            slot_offset = self._acquire_credit()
-            if slot_offset is None:
-                return self._put_cpu_fallback(
-                    from_stage, to_stage, put_key, composite_key, data, reason="credits_exhausted"
-                )
-            credit_returned = False
+    def _put_inline(self, from_stage, to_stage, put_key, composite_key, data, kh):
+        # Serialize (a cheap D2H for a tiny GPU tensor) straight into the ring body.
+        payload = self.serialize_obj(data)
+        if len(payload) > self._ring.body_max:
+            return self._put_cpu_fallback(
+                from_stage, to_stage, put_key, composite_key, data, reason=f"inline_too_big {len(payload)}"
+            )
+        try:
+            self._ring.publish(
+                kh, _RING_PCLASS_INLINE, payload, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
+            )
+        except RingFullError:
+            return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data, reason="ring_full")
+        self._metrics["puts"] += 1
+        self._metrics["bytes_transferred"] += len(payload)
+        return True, len(payload), {"ring": True, "size": len(payload)}
+
+    def _put_pool(self, from_stage, to_stage, put_key, composite_key, data, kh):
+        # Acquire a credit, D2D-pack into the slot, then publish a small descriptor
+        # (slot_offset/slot_index + tensor layout) to the ring.
+        slot_offset = self._acquire_credit()
+        if slot_offset is None:
+            return self._put_cpu_fallback(
+                from_stage, to_stage, put_key, composite_key, data, reason="credits_exhausted"
+            )
+        credit_returned = False
+        try:
+            self._board.buf[slot_offset // self._slot_size] = 0
+            slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
+            self._compute_event.record()
+            self._copy_stream.wait_event(self._compute_event)
             try:
-                self._board.buf[slot_offset // self._slot_size] = 0
-                slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
-                self._compute_event.record()
-                self._copy_stream.wait_event(self._compute_event)
-                try:
-                    with torch.cuda.stream(self._copy_stream):
-                        encoded_obj = self._walk_encode_pool(data, slot)
-                except _SlotOverflowError as e:
-                    self._copy_done_event.record(self._copy_stream)
-                    self._copy_done_event.synchronize()
-                    credit_returned = True
-                    self._credit_queue.put_nowait(slot_offset)
-                    return self._put_cpu_fallback(
-                        from_stage,
-                        to_stage,
-                        put_key,
-                        composite_key,
-                        data,
-                        reason=f"slot_overflow nbytes={e.nbytes} slot={e.slot_size}",
-                    )
-                ret = self._cudart.cudaEventRecord(self._ipc_event, ctypes.c_void_p(self._copy_stream.cuda_stream))
-                if ret != 0:
-                    logger.warning("cudaEventRecord (IPC) failed: %d", ret)
-                # Block until the pack D2D finishes: the source is a runner-owned tensor the
-                # next forward may free. Makes the pool D2D synchronous on both ends.
-                self._copy_stream.synchronize()
-                descriptor = OmniSerializer.serialize(
-                    {
-                        _POOL_MARKER: True,
-                        "slot_offset": slot_offset,
-                        "slot_index": slot_offset // self._slot_size,
-                        "payload": encoded_obj,
-                    }
-                )
-            except Exception:
-                if not credit_returned:
-                    self._credit_queue.put_nowait(slot_offset)
-                raise
-            # Descriptor grows with sequence length; if it overflows the ring body,
-            # degrade to the CPU fallback (read via _try_get_shm_compat) — never crash.
-            if len(descriptor) > self._ring._body_max:
+                with torch.cuda.stream(self._copy_stream):
+                    encoded_obj = self._walk_encode_pool(data, slot)
+            except _SlotOverflowError as e:
+                self._copy_done_event.record(self._copy_stream)
+                self._copy_done_event.synchronize()
+                credit_returned = True
                 self._credit_queue.put_nowait(slot_offset)
                 return self._put_cpu_fallback(
                     from_stage,
@@ -665,30 +659,52 @@ class CudaIPCConnector(OmniConnectorBase):
                     put_key,
                     composite_key,
                     data,
-                    reason=f"descriptor_too_big {len(descriptor)}>{self._ring._body_max}",
+                    reason=f"slot_overflow nbytes={e.nbytes} slot={e.slot_size}",
                 )
-            with self._held_lock:
-                self._held_credits[composite_key] = (_time_mod.time(), slot_offset)
-            try:
-                self._ring.publish(
-                    kh,
-                    _RING_PCLASS_POOL,
-                    descriptor,
-                    ts=int(_time_mod.time()),
-                    ttl_sec=int(self.tensor_lifetime_sec),
-                )
-            except RingFullError:
-                with self._held_lock:
-                    self._held_credits.pop(composite_key, None)
+            ret = self._cudart.cudaEventRecord(self._ipc_event, ctypes.c_void_p(self._copy_stream.cuda_stream))
+            if ret != 0:
+                logger.warning("cudaEventRecord (IPC) failed: %d", ret)
+            # Block until the pack D2D finishes: the source is a runner-owned tensor the
+            # next forward may free. Makes the pool D2D synchronous on both ends.
+            self._copy_stream.synchronize()
+            descriptor = OmniSerializer.serialize(
+                {
+                    _POOL_MARKER: True,
+                    "slot_offset": slot_offset,
+                    "slot_index": slot_offset // self._slot_size,
+                    "payload": encoded_obj,
+                }
+            )
+        except Exception:
+            if not credit_returned:
                 self._credit_queue.put_nowait(slot_offset)
-                return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data, reason="ring_full")
-            self._metrics["puts"] += 1
-            self._metrics["bytes_transferred"] += len(descriptor)
-            return True, len(descriptor), {"ring": True, "size": len(descriptor)}
-        except Exception as e:
-            self._metrics["errors"] += 1
-            logger.error("CudaIPCConnector ring put failed for %s: %s", put_key, e, exc_info=True)
-            return False, 0, None
+            raise
+        # Descriptor grows with sequence length; if it overflows the ring body,
+        # degrade to the CPU fallback (read via _try_get_shm_compat) — never crash.
+        if len(descriptor) > self._ring.body_max:
+            self._credit_queue.put_nowait(slot_offset)
+            return self._put_cpu_fallback(
+                from_stage,
+                to_stage,
+                put_key,
+                composite_key,
+                data,
+                reason=f"descriptor_too_big {len(descriptor)}>{self._ring.body_max}",
+            )
+        with self._held_lock:
+            self._held_credits[composite_key] = (_time_mod.time(), slot_offset)
+        try:
+            self._ring.publish(
+                kh, _RING_PCLASS_POOL, descriptor, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
+            )
+        except RingFullError:
+            with self._held_lock:
+                self._held_credits.pop(composite_key, None)
+            self._credit_queue.put_nowait(slot_offset)
+            return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data, reason="ring_full")
+        self._metrics["puts"] += 1
+        self._metrics["bytes_transferred"] += len(descriptor)
+        return True, len(descriptor), {"ring": True, "size": len(descriptor)}
 
     def _open_ring_receiver(self, from_stage, to_stage):
         edge = (from_stage, to_stage)
@@ -742,7 +758,7 @@ class CudaIPCConnector(OmniConnectorBase):
             copy_done_event = self._recv_copy_events[idx]
             if event_handle:
                 ipc_event = self._open_ipc_event(event_handle)
-                self._cudart.cudaStreamWaitEvent(ctypes.c_void_p(copy_stream.cuda_stream), ipc_event, ctypes.c_uint(0))
+                stream_wait_event(self._cudart, copy_stream.cuda_stream, ipc_event)
             copy_stream.wait_stream(torch.cuda.current_stream(self.local_device))
             obj = self._walk_decode_pool(raw["payload"], pool_ptr, raw["slot_offset"], stream=copy_stream)
             copy_done_event.record(copy_stream)
@@ -772,7 +788,7 @@ class CudaIPCConnector(OmniConnectorBase):
         if self._closed:
             return None
 
-        composite_key = f"{get_key}@{from_stage}_{to_stage}"
+        composite_key = self._make_composite_key(get_key, from_stage, to_stage)
         return self._get_ring(from_stage, to_stage, get_key, composite_key)
 
     def _try_get_shm_compat(self, get_key: str) -> tuple[Any, int] | None:
@@ -925,7 +941,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 if tick % self._release_ttl_every == 0:
                     self._release_expired_credits()
             except Exception as e:
-                logger.debug("Release loop error: %s", e)
+                logger.warning("Release loop error: %s", e, exc_info=True)
             self._stop_event.wait(timeout=self._release_interval_sec)
 
     # ------------------------------------------------------------------
@@ -933,14 +949,10 @@ class CudaIPCConnector(OmniConnectorBase):
     # ------------------------------------------------------------------
 
     def cleanup(self, request_id: str) -> None:
-        with self._held_lock:
-            keys_to_remove = [k for k in self._held_credits if k.startswith(f"{request_id}_")]
-            for k in keys_to_remove:
-                entry = self._held_credits.pop(k, None)
-                if entry:
-                    if self._board is not None:
-                        self._board.buf[entry[1] // self._slot_size] = 0
-                    self._credit_queue.put_nowait(entry[1])
+        # Required by OmniConnectorBase but a no-op here: credits are keyed by composite
+        # (put_key@from_to), not request_id, and are reclaimed by the release board + TTL
+        # sweep — there is no per-request connector state to free.
+        return
 
     def health(self) -> dict[str, Any]:
         return {
@@ -956,6 +968,14 @@ class CudaIPCConnector(OmniConnectorBase):
             **self._metrics,
         }
 
+    @staticmethod
+    def _try_or_warn(fn, label: str) -> None:
+        """Run a cleanup step, downgrading any failure to a warning (shutdown best-effort)."""
+        try:
+            fn()
+        except Exception as e:
+            logger.warning("%s failed: %s", label, e)
+
     def close(self) -> None:
         if self._closed:
             return
@@ -965,63 +985,45 @@ class CudaIPCConnector(OmniConnectorBase):
         self._stop_event.set()
         if self._release_thread is not None and self._release_thread.is_alive():
             self._release_thread.join(timeout=1.0)
-
         with self._held_lock:
             self._held_credits.clear()
 
-        # Close cached pool mappings
         for pool_ptr in self._opened_pools.values():
-            try:
-                self._close_ipc_ptr(pool_ptr)
-            except Exception as e:
-                logger.warning("Failed to close pool mapping: %s", e)
+            self._try_or_warn(lambda p=pool_ptr: self._close_ipc_ptr(p), "close pool mapping")
         self._opened_pools.clear()
 
-        # Destroy CUDA IPC events: the sender's own event (created with
-        # cudaEventCreateWithFlags) and any receiver-opened IPC events
-        # (cudaIpcOpenEventHandle) — both released via cudaEventDestroy.
+        # Destroy CUDA IPC events: sender's own + receiver-opened (cudaEventDestroy).
         if self._cudart is not None:
             own_event = getattr(self, "_ipc_event", None)
             if own_event is not None:
-                try:
-                    self._cudart.cudaEventDestroy(own_event)
-                except Exception as e:
-                    logger.warning("Failed to destroy sender IPC event: %s", e)
+                self._try_or_warn(lambda: self._cudart.cudaEventDestroy(own_event), "destroy sender IPC event")
                 self._ipc_event = None
             for evt in self._opened_events.values():
-                try:
-                    self._cudart.cudaEventDestroy(evt)
-                except Exception:
-                    pass
+                self._try_or_warn(lambda e=evt: self._cudart.cudaEventDestroy(e), "destroy opened IPC event")
             self._opened_events.clear()
 
-        # Release board(s)
         if self._board is not None:
-            try:
-                self._board.close()
-                self._board.unlink()
-            except Exception as e:
-                logger.warning("Failed to release board: %s", e)
+            self._try_or_warn(self._board.close, "release board close")
+            self._try_or_warn(self._board.unlink, "release board unlink")
             self._board = None
 
-        # Unlink any CPU-fallback /dev/shm segments still tracked (unconsumed at shutdown).
+        # Unlink any CPU-fallback shm still tracked (FileNotFoundError = receiver already took it).
         for name in list(getattr(self, "_fallback_segs", {}) or {}):
-            try:
-                seg = shm_pkg.SharedMemory(name=name)
+
+            def _unlink(n=name):
+                try:
+                    seg = shm_pkg.SharedMemory(name=n)
+                except FileNotFoundError:
+                    return
                 seg.close()
                 seg.unlink()
-            except FileNotFoundError:
-                pass
-            except Exception:
-                pass
+
+            self._try_or_warn(_unlink, f"unlink fallback seg {name}")
         if getattr(self, "_fallback_segs", None) is not None:
             self._fallback_segs.clear()
 
         for board in self._opened_boards.values():
-            try:
-                board.close()
-            except Exception:
-                pass
+            self._try_or_warn(board.close, "close opened board")
         self._opened_boards.clear()
 
         # Ring control plane: sender unlinks its ring; receiver closes opens.
@@ -1029,18 +1031,10 @@ class CudaIPCConnector(OmniConnectorBase):
             self._ring.close()  # owner -> unlinks
             self._ring = None
         for ring in self._opened_rings.values():
-            try:
-                ring.close()
-            except Exception:
-                pass
+            self._try_or_warn(ring.close, "close opened ring")
         self._opened_rings.clear()
 
         self._pool = None
-
         if torch.cuda.is_available():
-            try:
-                torch.cuda.ipc_collect()
-            except Exception as e:
-                logger.warning(f"torch.cuda.ipc_collect() failed: {e}")
-
+            self._try_or_warn(torch.cuda.ipc_collect, "torch.cuda.ipc_collect")
         logger.info("CudaIPCConnector closed.")
