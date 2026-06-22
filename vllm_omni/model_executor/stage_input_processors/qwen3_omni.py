@@ -110,12 +110,15 @@ def _ensure_list(x):
     return list(x)
 
 
-def _as_tensor_or_none(value: Any) -> torch.Tensor | None:
+def _as_tensor_or_none(value: Any, keep_on_gpu: bool = False) -> torch.Tensor | None:
+    t: torch.Tensor | None = None
     if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    if isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
-        return value[0].detach().cpu()
-    return None
+        t = value
+    elif isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
+        t = value[0]
+    if t is None:
+        return None
+    return t.detach() if keep_on_gpu else t.detach().cpu()
 
 
 def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
@@ -594,14 +597,25 @@ def thinker2talker_full_payload(
     else:
         thinker_hid_prefill = thinker_hid
 
+    # Honor the output connector's capability uniformly: a GPU-tensor connector
+    # (CudaIPC) keeps tensors on-device for D2D; otherwise drop to CPU (the
+    # SharedMemoryConnector wire format). Previously prefill/output were left on
+    # GPU unconditionally while tts_* were forced to CPU — inconsistent, and for a
+    # non-GPU connector it leaned on the serializer's .cpu() safety net.
+    _connector = getattr(transfer_manager, "output_connector", None) or getattr(transfer_manager, "connector", None)
+    _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
+
+    def _place(t: torch.Tensor) -> torch.Tensor:
+        return t.detach() if _keep_on_gpu else t.detach().cpu()
+
     payload: OmniPayload = {
         "embed": {
-            "prefill": thinker_emb_prefill.detach(),
-            "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos")),
-            "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos")),
-            "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad")),
+            "prefill": _place(thinker_emb_prefill),
+            "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos"), keep_on_gpu=_keep_on_gpu),
+            "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos"), keep_on_gpu=_keep_on_gpu),
+            "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad"), keep_on_gpu=_keep_on_gpu),
         },
-        "hidden_states": {"output": thinker_hid_prefill.detach()},
+        "hidden_states": {"output": _place(thinker_hid_prefill)},
         "ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }

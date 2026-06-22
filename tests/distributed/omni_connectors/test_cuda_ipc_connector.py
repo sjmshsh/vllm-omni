@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for the CudaIPC connector and its IpcRing control plane.
+"""Unit tests for the CudaIPC connector and its CudaIpcControlRing control plane.
 
 Two layers, gated independently:
 
-1. ``IpcRing`` (the lock-free SPSC keyed-mailbox control plane defined in
-   ``cuda_ipc_connector.py``): pure-Python, NO CUDA — these tests run anywhere a CPU
-   torch import works, incl. CPU-only CI.
+1. ``CudaIpcControlRing`` (the lock-free SPSC keyed-mailbox control plane in ``cuda_ipc_control_ring.py``):
+   pure-Python (struct + POSIX shm), NO CUDA — imported directly (does not pull torch),
+   so these run anywhere, incl. CPU-only CI.
 
 2. ``CudaIPCConnector`` functional put/get: requires a real GPU. CUDA IPC handles cannot be
    opened in the same process that created them, so these spawn sender + receiver processes.
@@ -24,15 +24,14 @@ import pytest
 import torch
 
 # ════════════════════════════════════════════════════════════════════
-# Layer 1 — IpcRing control plane (CPU-only, runs in CI without a GPU)
+# Layer 1 — CudaIpcControlRing control plane (CPU-only, runs in CI without a GPU)
 # ════════════════════════════════════════════════════════════════════
 #
-# Single-mapping publish/poll protocol tests. Cross-process / cross-mapping integrity is
-# separately exercised by tests/dfx/perf/ipc_ring_soak.py (the real deployment shape).
+# Single-mapping publish/poll protocol tests.
 # NOTE: same-process re-open() of a SharedMemory segment is not coherent on macOS, so these
 # poll from the producing ring object directly.
-from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import (
-    IpcRing,
+from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_control_ring import (
+    CudaIpcControlRing,
     RingFullError,
 )
 
@@ -48,7 +47,7 @@ def _kh(s: str) -> bytes:
 def ring():
     """A small sender-owned ring; unlinks on close."""
     name = f"test_ipc_ring_{uuid.uuid4().hex[:12]}"
-    r = IpcRing.create(name, n_slots=8, body_max=64, header_bytes=32)
+    r = CudaIpcControlRing.create(name, n_slots=8, body_max=64, header_bytes=32)
     yield r
     r.close()
 
