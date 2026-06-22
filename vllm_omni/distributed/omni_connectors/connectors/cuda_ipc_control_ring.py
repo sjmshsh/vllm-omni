@@ -3,34 +3,16 @@
 
 """Per-edge SPSC keyed mailbox ring — the CudaIPC connector's control plane.
 
-Replaces the per-transfer /dev/shm round-trip (shm_open+ftruncate+mmap+rename+
-unlink, ~5-6 syscalls/chunk) with ONE pre-allocated ring per directed edge,
-opened once. The sender publishes a fixed-stride entry; the receiver looks it
-up by key — both fenceless, correct on x86 TSO (the NVIDIA target; ARM/POWER
-would need an explicit store fence).
+One pre-allocated ring per directed edge (opened once) replaces the per-transfer /dev/shm
+round-trip. Sender publishes a fixed-stride entry; receiver looks it up by key — fenceless,
+correct on x86 TSO (ARM/POWER would need a store fence).
 
-SPSC: exactly one producer (TP rank0 sender) and one consumer (leader
-receiver) per directed edge. Lock-free correctness rests on:
-  - body-first / seq-LAST publish (seq is the release marker; a reader that
-    sees seq>0 has seen the whole body on TSO),
-  - a seq==0 IN-PROGRESS sentinel written FIRST on (re)claim, so a reader
-    never matches a half-written slot,
-  - a seqlock re-read (seq before == seq after, both !=0) guarding the body,
-  - a per-slot consumed byte so the producer never reuses a slot the consumer
-    has not taken (bounded backpressure => no reuse-after-wrap torn read),
-  - open addressing by key hash (linear probe) so arbitrary, non-sequential
-    composite keys map to slots and out-of-order keyed lookup is O(1) amort.
+Lock-free SPSC correctness: body-first / seq-LAST publish (seq is the release marker); a
+seq==0 in-progress sentinel written first on (re)claim; a seqlock re-read guarding the body;
+a per-slot consumed byte for bounded backpressure; open addressing by key hash.
 
-Pure-Python (struct + POSIX shared memory), no CUDA — testable on CPU.
-
-Per-slot layout (little-endian):
-  seq      u64  @0   publish marker, written LAST; 0 = empty / in-progress
-  consumed u8   @8   set by consumer; producer reuses iff consumed==1 (or seq==0)
-  pclass   u8   @9   0=inline payload, 1=pool descriptor
-  ts       u32  @10  publish time (epoch s) for TTL reclaim of aborted entries
-  keyhash  16B  @14  sha1(composite_key)[:16]
-  blen     u32  @30  body length
-  body     ...  @34
+Pure-Python (struct + POSIX shm), no CUDA — testable on CPU. Per-slot layout (little-endian):
+seq u64@0 | consumed u8@8 | pclass u8@9 | ts u32@10 | keyhash 16B@14 | blen u32@30 | body@34.
 """
 
 import struct

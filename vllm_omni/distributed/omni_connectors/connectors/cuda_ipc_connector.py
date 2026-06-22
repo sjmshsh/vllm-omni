@@ -3,22 +3,16 @@
 
 """CUDA IPC connector: GPU-to-GPU transfer over a pre-allocated pool + per-edge ring.
 
-- Sender allocates one GPU pool, exports its IPC handle once, and splits it into
-  credit-managed slots; put() copies tensors into a slot (D2D, no per-tensor handle).
-- Control plane: a per-edge keyed mailbox ring (``CudaIpcControlRing``) carries small
-  payloads inline and big-payload pool descriptors, opened once per edge.
+- Sender allocates one GPU pool, exports its IPC handle once, splits it into credit slots;
+  put() copies tensors into a slot (D2D).
+- Control plane: a per-edge keyed ring (``CudaIpcControlRing``) carries small payloads inline
+  and big-payload pool descriptors, opened once per edge.
 - Receiver opens the pool handle once (cached) and D2D-copies from the slot offset.
-- Credit release via a shared-memory "release board" (1 byte/slot): the receiver flips
-  its slot byte; the sender reclaims by reading the board. A TTL sweep reclaims slots
-  whose receiver died before marking it.
-- Ordering: both ends synchronize their copy stream before handing off the buffer
-  (sender after pack-D2D, receiver after the pool-read D2D) — no async use-after-free.
-- Fallback: on credit/ring exhaustion or payload overflow, put() degrades to CPU
-  serialization via /dev/shm (SharedMemoryConnector wire format); never blocks.
+- Credit release via a shared-memory release board (1 byte/slot) + a TTL sweep.
+- Ordering: both ends synchronize their copy stream before hand-off — no async use-after-free.
+- Fallback: on credit/ring exhaustion or payload overflow, put() degrades to CPU /dev/shm.
 
-Limitation: no sender live-restart. The receiver caches the sender's opened IPC pool/event
-handles, so if the sender process restarts (new handles) the receiver will not self-heal —
-restart the whole edge. Targets static, co-launched stage processes.
+Limitation: no sender live-restart (receiver caches the sender's IPC handles); restart the edge.
 """
 
 import ctypes
@@ -58,9 +52,8 @@ _POOL_MARKER = "__cuda_ipc_pool__"
 
 _POOL_ALIGNMENT = 16  # bytes, for GPU copy efficiency
 
-# Pool defaults: auto-sized when user omits pool_size_mb / pool_credits.
-# Auto formula: credits = max(64, max_num_seqs * 4), size = credits * 2 MB.
-# Explicit extra config values override auto-sizing.
+# Auto-size when pool_size_mb / pool_credits are omitted: credits = max(64, max_num_seqs*4),
+# size = credits * 2 MB. Explicit config overrides.
 _DEFAULT_POOL_SIZE_MB = 128
 _DEFAULT_POOL_CREDITS = 64
 _DEFAULT_RECV_STREAMS = 8  # receiver D2D copy streams (round-robined per get)
@@ -333,9 +326,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._release_thread = threading.Thread(target=self._release_loop, daemon=True, name="cuda-ipc-release-loop")
         self._release_thread.start()
 
-    # ------------------------------------------------------------------
-    # Device & naming helpers
-    # ------------------------------------------------------------------
+    # --- Device & naming helpers ---
 
     @staticmethod
     def _resolve_local_device(local_device_cfg: str | int) -> torch.device:
@@ -381,9 +372,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 f"D2D copy will fall back to PCIe staging (slower than NVLink)."
             )
 
-    # ------------------------------------------------------------------
-    # Low-level CUDA IPC via ctypes (bindings in cuda_ipc_runtime.load_cudart)
-    # ------------------------------------------------------------------
+    # --- Low-level CUDA IPC via ctypes (bindings in cuda_ipc_runtime.load_cudart) ---
 
     def _get_ipc_handle(self, ptr: int) -> bytes:
         """Obtain a 64-byte CUDA IPC memory handle for a device pointer."""
@@ -427,9 +416,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 self._opened_events[handle_bytes] = event
             return self._opened_events[handle_bytes]
 
-    # ------------------------------------------------------------------
-    # Pool-based encode / decode
-    # ------------------------------------------------------------------
+    # --- Pool-based encode / decode ---
 
     def _walk_encode_pool(self, obj: Any, slot: _PoolSlot) -> Any:
         """Recursively replace CUDA tensors with pool offset metadata."""
@@ -513,9 +500,7 @@ class CudaIPCConnector(OmniConnectorBase):
             return tuple(self._walk_decode_pool(v, pool_ptr, slot_offset, stream=stream) for v in obj)
         return obj
 
-    # ------------------------------------------------------------------
-    # put() — Sender side
-    # ------------------------------------------------------------------
+    # --- put() — Sender side ---
 
     def put(
         self,
@@ -565,10 +550,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._metrics["bytes_transferred"] += size
         return True, size, {"shm": meta, "size": size, "cpu_fallback": True}
 
-    # ------------------------------------------------------------------
-    # Ring control plane — put/get over the per-edge SPSC mailbox.
-    # The only transport path; replaces the per-transfer /dev/shm round-trip.
-    # ------------------------------------------------------------------
+    # --- Ring control plane: put/get over the per-edge SPSC mailbox ---
 
     def _ring_name(self, from_stage, to_stage) -> str:
         # Hash the edge identity — deployment_id may carry chars invalid/unsafe for a POSIX
@@ -715,10 +697,8 @@ class CudaIPCConnector(OmniConnectorBase):
             except FileNotFoundError:
                 return None  # sender not up yet; poll loop tolerates None
             self._opened_rings[edge] = ring
-        # Parse the header only once a valid (magic+version) one is present. If the sender
-        # opened the ring but hasn't written the header yet, defer — never cache zero handles.
-        # Safe to gate on this: write_header() precedes the sender's first publish(), so any
-        # pollable entry implies the header is already readable.
+        # Cache the parsed header only once a valid (magic+version) one is present — never
+        # cache zero handles from a ring whose sender hasn't written the header yet.
         if edge not in self._ring_edge_handles:
             hdr = RingHeader.try_unpack(ring.read_header(_RING_HEADER_BYTES))
             if hdr is not None:
@@ -774,9 +754,7 @@ class CudaIPCConnector(OmniConnectorBase):
             logger.error("CudaIPCConnector ring get failed for %s: %s", get_key, e, exc_info=True)
             return None
 
-    # ------------------------------------------------------------------
-    # get() — Receiver side
-    # ------------------------------------------------------------------
+    # --- get() — Receiver side ---
 
     def get(
         self,
@@ -844,9 +822,7 @@ class CudaIPCConnector(OmniConnectorBase):
             return tuple(self._move_to_device(v, non_blocking) for v in obj)
         return obj
 
-    # ------------------------------------------------------------------
-    # Credit release: shared-memory board (fast path) + TTL sweep
-    # ------------------------------------------------------------------
+    # --- Credit release: shared-memory board (fast path) + TTL sweep ---
 
     def _mark_board_release(self, board_name: str, slot_index: int) -> None:
         """Receiver: flip the slot byte on the sender's release board."""
@@ -944,14 +920,11 @@ class CudaIPCConnector(OmniConnectorBase):
                 logger.warning("Release loop error: %s", e, exc_info=True)
             self._stop_event.wait(timeout=self._release_interval_sec)
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    # --- Lifecycle ---
 
     def cleanup(self, request_id: str) -> None:
-        # Required by OmniConnectorBase but a no-op here: credits are keyed by composite
-        # (put_key@from_to), not request_id, and are reclaimed by the release board + TTL
-        # sweep — there is no per-request connector state to free.
+        # Required by OmniConnectorBase but a no-op: credits are reclaimed by the release
+        # board + TTL sweep, not per request_id.
         return
 
     def health(self) -> dict[str, Any]:
