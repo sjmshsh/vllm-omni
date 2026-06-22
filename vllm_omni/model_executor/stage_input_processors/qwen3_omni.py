@@ -271,6 +271,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     thinker_emb,
     thinker_hid,
     transfer_manager,
+    keep_on_gpu: bool = False,
 ) -> OmniPayloadStruct | None:
     """Build Thinker -> Talker payloads for realtime streaming input chunks.
 
@@ -287,8 +288,9 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
-    emb_cpu = thinker_emb.detach().cpu()
-    hid_cpu = thinker_hid.detach().cpu()
+    # Keep on GPU for a GPU-direct connector (D2D); else drop to CPU.
+    emb_cpu = thinker_emb.detach() if keep_on_gpu else thinker_emb.detach().cpu()
+    hid_cpu = thinker_hid.detach() if keep_on_gpu else thinker_hid.detach().cpu()
 
     if output_token_ids:
         if thinker_emb.shape[0] > 1:
@@ -515,7 +517,7 @@ def thinker2talker_async_chunk(
     else:
         if request.resumable:
             return _construct_thinker2talker_streaming_input_async_chunk(
-                is_finished, request, thinker_emb, thinker_hid, transfer_manager
+                is_finished, request, thinker_emb, thinker_hid, transfer_manager, keep_on_gpu=_keep_on_gpu
             )
         if thinker_emb.shape[0] > 1:
             logger.warning(

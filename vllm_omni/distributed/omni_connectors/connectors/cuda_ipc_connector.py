@@ -457,8 +457,8 @@ class CudaIPCConnector(OmniConnectorBase):
         nbytes = int(meta["nbytes"])
         tensor_offset = int(meta["pool_offset"])
         target_stream = stream if stream is not None else torch.cuda.current_stream(self.local_device)
-        # Allocate dst ON target_stream so its owning stream IS the D2D copy stream — no
-        # cross-stream use, no record_stream needed; _get_ring's copy_done sync covers its lifetime.
+        # Allocate dst on target_stream (the D2D copy stream) to avoid an alloc-vs-copy
+        # cross-stream race at write time.
         with torch.cuda.stream(target_stream):
             dst = torch.empty(shape, dtype=dtype, device=self.local_device)
         src = ctypes.c_void_p(pool_ptr.value + slot_offset + tensor_offset)
@@ -471,6 +471,9 @@ class CudaIPCConnector(OmniConnectorBase):
         )
         if ret != 0:
             raise RuntimeError(f"cudaMemcpyAsync (pool decode) failed with code {ret}")
+        # dst is consumed downstream on the model/default stream and may be cached across
+        # steps; record it there so the allocator won't reuse its memory while that use is live.
+        dst.record_stream(torch.cuda.current_stream(self.local_device))
         self._metrics["gpu_tensors_transferred"] += 1
         return dst
 
@@ -728,14 +731,9 @@ class CudaIPCConnector(OmniConnectorBase):
                 self._metrics["bytes_transferred"] += len(body)
                 return obj, len(body)
 
-            # POOL: read the edge-constant handles from the
-            # ring header and the slot descriptor from the entry body.
-            edge_handles = self._ring_edge_handles.get((from_stage, to_stage))
-            if edge_handles is None:
-                # Header not parsed yet (write_header precedes publish, so this is rare):
-                # leave the entry unconsumed and retry on the next poll.
-                return None
-            pool_handle, event_handle, board_name = edge_handles
+            # POOL: handles from the ring header (guaranteed present — the poll above is gated
+            # on _ring_edge_handles), descriptor from the entry body.
+            pool_handle, event_handle, board_name = self._ring_edge_handles[(from_stage, to_stage)]
             raw = OmniSerializer.deserialize(body)
             pool_ptr = self._open_pool(pool_handle)
             idx = self._recv_stream_idx % len(self._recv_copy_streams)

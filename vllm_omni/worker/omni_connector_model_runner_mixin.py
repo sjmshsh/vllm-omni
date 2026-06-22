@@ -100,9 +100,10 @@ class OmniConnectorModelRunnerMixin:
         """
         self._input_connector: OmniConnectorBase | None
         self._output_connector: OmniConnectorBase | None
-        # Resolve the data-transfer rank BEFORE building connectors: on TP>1 only this rank
-        # may own the per-edge ring, so it is injected into the connector config.
-        self._local_rank = self._parse_rank_mapping(model_config)["local_rank"]
+        # Parse rank mapping once: is_data_transfer_rank() (used right below to gate ring
+        # ownership) needs _local_rank, and the heterogeneous-TP fields reuse rank_cfg below.
+        rank_cfg = self._parse_rank_mapping(model_config)
+        self._local_rank: int = rank_cfg["local_rank"]
         self._input_connector, self._output_connector = self._create_connectors(
             model_config, is_transfer_rank=self.is_data_transfer_rank()
         )
@@ -134,11 +135,9 @@ class OmniConnectorModelRunnerMixin:
         # -- next stage ID (from connector config or default stage_id + 1) --
         self._next_stage_id: int = self._resolve_next_stage_id(model_config)
 
-        # -- heterogeneous TP rank support --
-        rank_cfg = self._parse_rank_mapping(model_config)
+        # -- heterogeneous TP rank support (rank_cfg parsed above) --
         self._from_tp: int = rank_cfg["from_tp"]
         self._to_tp: int = rank_cfg["to_tp"]
-        self._local_rank: int = rank_cfg["local_rank"]
         if self._kv_transfer_manager is not None:
             self._kv_transfer_manager.kv_send_key_builder = self.get_rank_aware_kv_send_keys
             self._kv_transfer_manager.kv_recv_key_builder = self.get_rank_aware_kv_keys

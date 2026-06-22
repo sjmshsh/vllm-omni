@@ -19,8 +19,8 @@ connectors:
       # Ring mode: small chunks go INLINE (no pool credit), so the pool ONLY holds the
       # big prefill handoff (~16MB for input 4000, ~4KB/token).
       pool_size_mb: 1536
-      pool_credits: 32
-      inline_threshold_bytes: 16384   # < 16KB -> inline (no credit/pool/D2D)
+      pool_credits: 64               # match max_num_seqs so concurrent prefills don't exhaust
+      inline_threshold_bytes: 16384   # < 16KB -> inline (no credit/pool/D2D); 1536/64 = 24MB slot >= 16MB prefill
       ring_body_max: 524288           # 512KB: pool descriptors (ids ~40KB@in4000) + headroom
       # 2048 slots x 512KB ~ 1GB host shm per ring (~2GB for s0->s1 + s1->s2).
       ring_entries: 2048
