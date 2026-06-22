@@ -93,6 +93,10 @@ class CudaIpcControlRing:
         shm = shm_pkg.SharedMemory(name=name)
         untrack_shm(name)  # non-owner: never unlink the sender's ring at exit
         n_slots, body_max = struct.unpack_from("<II", shm.buf, 0)
+        if n_slots <= 0 or body_max <= 0:
+            # Opened before the sender's header write (zero-filled) — not ready; caller retries.
+            shm.close()
+            raise FileNotFoundError(f"ring {name!r} not initialized yet (n_slots={n_slots}, body_max={body_max})")
         # header size is implied by the on-wire layout the sender chose; the caller
         # passes the same header_bytes contract. We recover it from total size.
         total = shm.size

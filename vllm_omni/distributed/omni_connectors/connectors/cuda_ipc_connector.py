@@ -156,9 +156,8 @@ class CudaIPCConnector(OmniConnectorBase):
         if self.role not in {"sender", "receiver"}:
             raise ValueError(f"Invalid role={self.role!r}. Expected 'sender' or 'receiver'.")
         self.tensor_lifetime_sec = float(config.get("tensor_lifetime_sec", 30.0))
-        # deployment_id isolates co-located services / runs on the same host (authoritative,
-        # passed in by the launcher — never connector-generated, since sender and receiver
-        # must agree). "default" only safe for single-run tests/dev.
+        # deployment_id isolates co-located services on one host (launcher-set, never
+        # connector-generated — both ends must agree). "default" = tests/dev only.
         self._deployment_id = str(config.get("deployment_id", "default"))
         if self._deployment_id == "default":
             logger.warning(
@@ -167,10 +166,8 @@ class CudaIPCConnector(OmniConnectorBase):
                 "'default' is only safe for single-run tests/dev)."
             )
         self._num_replicas = int(config.get("num_replicas", 1))
-        # replica_id makes the ring name unique across same-host replicas of a stage. The
-        # engine-core process publishes its assigned id as VLLM_OMNI_REPLICA_ID (set in
-        # stage_engine_core_proc); sender and receiver of an aligned 1:1 edge resolve the
-        # same value, so their names match.
+        # replica_id (per same-host replica) from VLLM_OMNI_REPLICA_ID, set by the engine-core
+        # process. Aligned 1:1 edges: sender and receiver resolve the same value.
         _rid = config.get("replica_id")
         if _rid is None:
             _rid = os.environ.get("VLLM_OMNI_REPLICA_ID", 0)
@@ -234,7 +231,9 @@ class CudaIPCConnector(OmniConnectorBase):
         self._slot_size = self._pool_size // pool_credits
         self._pool_credits = pool_credits
 
-        if self.role == "sender":
+        # Only the data-transfer rank allocates the sender pool/board/ring; non-transfer ranks
+        # never transmit, so allocating there wastes a full pool (and would collide).
+        if self.role == "sender" and self._is_transfer_rank:
             with torch.cuda.device(self.local_device):
                 self._pool = torch.zeros(self._pool_size, dtype=torch.uint8, device=self.local_device)
                 self._copy_stream = torch.cuda.Stream(device=self.local_device)
@@ -261,23 +260,23 @@ class CudaIPCConnector(OmniConnectorBase):
             self._board_name = f"cudaipc_board_{uuid.uuid4().hex[:16]}"
             self._board = shm_pkg.SharedMemory(create=True, size=pool_credits, name=self._board_name)
             self._board.buf[:pool_credits] = bytes(pool_credits)
-            # Only the data-transfer rank owns the per-edge ring; non-transfer ranks never
-            # transmit, so creating a same-named ring there would unlink the real owner's.
-            if self._is_transfer_rank:
-                n_slots = self._ring_entries_cfg or max(64, pool_credits * 4)
-                body_max = max(self._ring_body_max, self._inline_threshold)
-                self._ring = CudaIpcControlRing.create(
-                    self._ring_name(self.stage_id, self.stage_id + 1),
-                    n_slots,
-                    body_max,
-                    header_bytes=_RING_HEADER_BYTES,
-                )
-                self._ring.write_header(self._ring_header_blob())
+            n_slots = self._ring_entries_cfg or max(64, pool_credits * 4)
+            body_max = max(self._ring_body_max, self._inline_threshold)
+            self._ring = CudaIpcControlRing.create(
+                self._ring_name(self.stage_id, self.stage_id + 1),
+                n_slots,
+                body_max,
+                header_bytes=_RING_HEADER_BYTES,
+            )
+            self._ring.write_header(self._ring_header_blob())
         else:
+            # Receiver, OR a non-transfer-rank sender (inert: never transmits). No GPU pool,
+            # board or ring — sender-only attrs are left unset and never read on this path.
             self._pool = None
             self._pool_handle = None
             self._credit_queue = None
             self._held_credits = {}
+            self._fallback_segs = {}
             self._board_name = None
             self._board = None
             _NUM_RECV_STREAMS = 8
@@ -296,7 +295,7 @@ class CudaIPCConnector(OmniConnectorBase):
         if torch.accelerator.device_count() > 1:
             self._validate_p2p_access()
 
-        if self.role == "sender":
+        if self.role == "sender" and self._is_transfer_rank:
             self._release_thread = threading.Thread(
                 target=self._release_loop, daemon=True, name="cuda-ipc-release-loop"
             )
@@ -705,6 +704,9 @@ class CudaIPCConnector(OmniConnectorBase):
             ring = self._open_ring_receiver(from_stage, to_stage)
             if ring is None:
                 return None
+            if (from_stage, to_stage) not in self._ring_edge_handles:
+                # Header not ready — don't poll (poll consumes; a pool entry would be lost). Retry.
+                return None
             r = ring.poll(self._key_hash16(composite_key))
             if r is None:
                 # Ring miss: chunk not published yet (poll retry), or the sender took the CPU
@@ -770,21 +772,13 @@ class CudaIPCConnector(OmniConnectorBase):
 
     def _try_get_shm_compat(self, get_key: str) -> tuple[Any, int] | None:
         try:
-            try:
-                seg = shm_pkg.SharedMemory(name=get_key)
-            except FileNotFoundError:
-                return None
-
-            try:
-                mv = memoryview(seg.buf)
-                data_bytes = bytes(mv[: seg.size])
-                del mv
-            finally:
-                try:
-                    seg.close()
-                except Exception:
-                    pass
-
+            seg = shm_pkg.SharedMemory(name=get_key)
+        except FileNotFoundError:
+            return None
+        # Hold this one handle through read AND unlink — never close-then-reopen-by-name,
+        # which races a same-key segment the sender may have just rewritten.
+        try:
+            data_bytes = bytes(seg.buf[: seg.size])
             try:
                 obj = self.deserialize_obj(data_bytes)
             except Exception as de:
@@ -798,37 +792,24 @@ class CudaIPCConnector(OmniConnectorBase):
                     len(data_bytes),
                 )
                 if n >= 3:
-                    try:
-                        seg = shm_pkg.SharedMemory(name=get_key)
-                        try:
-                            seg.unlink()
-                        finally:
-                            seg.close()
-                    except Exception:
-                        pass
+                    seg.unlink()
                 return None
 
             self._shm_compat_decode_failures.pop(get_key, None)
-            try:
-                seg = shm_pkg.SharedMemory(name=get_key)
-                try:
-                    seg.unlink()
-                finally:
-                    seg.close()
-            except Exception:
-                pass
-
+            seg.unlink()
             obj = self._move_to_device(obj)
-
             size = len(data_bytes)
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += size
             return obj, size
-        except FileNotFoundError:
-            return None
         except Exception as e:
             logger.warning("CudaIPCConnector shm_compat get failed for %s: %s", get_key, e)
             return None
+        finally:
+            try:
+                seg.close()
+            except Exception:
+                pass
 
     def _move_to_device(self, obj: Any, non_blocking: bool = True) -> Any:
         """Move CPU tensors to local GPU so CUDA graph replay is safe."""
