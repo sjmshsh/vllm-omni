@@ -5,13 +5,11 @@
 Two layers, gated independently:
 
 1. ``CudaIpcControlRing`` (the lock-free SPSC keyed-mailbox control plane in ``cuda_ipc_control_ring.py``):
-   pure-Python (struct + POSIX shm), NO CUDA — imported directly (does not pull torch),
-   so these run anywhere, incl. CPU-only CI.
+   pure-Python (struct + POSIX shm), CPU-only CI.
 
 2. ``CudaIPCConnector`` functional put/get: requires a real GPU. CUDA IPC handles cannot be
    opened in the same process that created them, so these spawn sender + receiver processes.
-   The GPU gate is on ``TestCudaIPCFunctional`` (class level), NOT module level, so it does
-   not skip the CPU ring tests above.
+   The GPU gate does not skip the CPU ring tests above.
 """
 
 from __future__ import annotations
@@ -28,8 +26,6 @@ import torch
 # ════════════════════════════════════════════════════════════════════
 #
 # Single-mapping publish/poll protocol tests.
-# NOTE: same-process re-open() of a SharedMemory segment is not coherent on macOS, so these
-# poll from the producing ring object directly.
 from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_control_ring import (
     CudaIpcControlRing,
     RingFullError,
@@ -123,7 +119,7 @@ def test_ring_body_too_big_raises(ring):
 
 
 def test_ring_ttl_reclaims_stale_entry(ring):
-    """C4: an occupied-but-unconsumed slot older than ttl_sec is reclaimed in place so an
+    """An occupied-but-unconsumed slot older than ttl_sec is reclaimed in place so an
     aborted/never-polled request cannot wedge the ring. Fresh entries are NOT reclaimed."""
     for i in range(8):  # fill at t=100, never consumed
         ring.publish(_kh(f"stale-{i}"), 0, b"old", ts=100, ttl_sec=30)
