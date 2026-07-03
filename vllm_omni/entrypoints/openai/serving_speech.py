@@ -7,6 +7,7 @@ import math
 import os
 import re
 import struct
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -329,6 +330,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._higgs_audio_v3_ref_code_cache_bytes = 0
         self._higgs_audio_v3_ref_code_inflight: dict[str, asyncio.Task[torch.Tensor]] = {}
         self._speaker_cache = get_speaker_cache()
+        self._moss_reference_encoders: dict[tuple[int, str, int, int], Any] = {}
+        self._moss_reference_encoders_lock = threading.Lock()
         self._last_upload_ts = 0
         self._upload_lock = asyncio.Lock()
         self._restore_uploaded_speakers()
@@ -665,6 +668,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._tts_executor is not None:
             self._tts_executor.shutdown(wait=False, cancel_futures=True)
             self._tts_executor = None
+        # Close each MOSS-TTS reference encoder so its daemon batching
+        # thread exits cleanly. Each ``close()`` is best-effort with a
+        # bounded join, so a stuck encoder can't block server shutdown.
+        with self._moss_reference_encoders_lock:
+            encoders = list(self._moss_reference_encoders.values())
+            self._moss_reference_encoders.clear()
+        for encoder in encoders:
+            try:
+                encoder.close()
+            except Exception:
+                logger.exception("MOSS-TTS reference encoder close() failed")
         for name in list(self.uploaded_speakers.keys()):
             self._speaker_cache.clear(name)
 
@@ -1856,6 +1870,42 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._moss_processor_cache = proc
         return proc
 
+    def _get_moss_reference_encoder(
+        self,
+        processor: Any,
+        variant: str,
+        n_vq: int,
+        sr_target: int,
+    ) -> Any:
+        """Return the MOSS-TTS reference encoder for this variant, creating it on demand.
+
+        One instance is held per ``(id(processor), variant, n_vq, sr_target)``
+        so the daemon batching thread and content-addressed LRU are reused
+        across requests. ``shutdown`` closes each instance cleanly. The
+        factory import is lazy so unrelated model paths never pull the MOSS
+        module.
+        """
+        key = (id(processor), str(variant), int(n_vq), int(sr_target))
+        encoder = self._moss_reference_encoders.get(key)
+        if encoder is not None:
+            return encoder
+        with self._moss_reference_encoders_lock:
+            encoder = self._moss_reference_encoders.get(key)
+            if encoder is not None:
+                return encoder
+            from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
+                create_reference_encoder,
+            )
+
+            encoder = create_reference_encoder(
+                processor,
+                variant=str(variant),
+                n_vq=int(n_vq),
+                sr_target=int(sr_target),
+            )
+            self._moss_reference_encoders[key] = encoder
+        return encoder
+
     async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build the talker prompt + ``additional_information`` payload for any
         MOSS-TTS-family request (nano + 5 full variants).
@@ -1926,30 +1976,31 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # offline example's hardcoded encode_audios_from_wav(sampling_rate=24000)
         # for this variant; proc.model_config.sampling_rate there is the
         # output rate (48000), the wrong value to resample the reference into.
-        sr_target = 24000 if v == "local" else int(getattr(proc.model_config, "sampling_rate", 24000))
+        sr_target = (
+            24000
+            if v == "local"
+            else int(getattr(proc.model_config, "sampling_rate", 24000))
+        )
 
-        # Reference-audio encoding + speaker caching lives in the model package
+        # Reference-audio encoding + caching lives in the model package
         # (moss_tts.reference_encoder), mirroring Fish Speech / CosyVoice3 /
         # Qwen3-TTS which keep reference handling with the model rather than in
-        # this shared serving file. Imported lazily so the API-server process
-        # only pulls it on the delay-family path (alongside the upstream proc).
-        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
-
-        _voice = getattr(request, "voice", None)
-        _voice = _voice.strip() if isinstance(_voice, str) else ""
-        _voice_created = self._voice_created_at(_voice.lower()) if _voice else 0
+        # this shared serving file. The serving layer explicitly owns the
+        # encoder instance (one per (processor, variant, n_vq, sr_target)):
+        # the getter constructs it on first request and ``shutdown`` closes it
+        # cleanly, replacing the old module-level weakref singleton.
+        #
+        # Named voices and anonymous refs share the same content-addressed
+        # LRU inside the encoder: the cache key is a hash of the resolved
+        # waveform + sample rate, so a re-uploaded named voice naturally
+        # lands on a distinct entry (the old one ages out) and two names
+        # pointing at the same decoded audio collapse to one entry.
+        encoder = self._get_moss_reference_encoder(proc, v, n_vq, sr_target)
 
         async def _encode_ref(ref_str: str) -> torch.Tensor:
-            return await encode_reference_codes(
+            return await encoder.encode_reference_codes(
                 ref_str,
-                processor=proc,
                 resolve_ref_audio=self._resolve_ref_audio,
-                speaker_cache=self._speaker_cache,
-                variant=v,
-                n_vq=n_vq,
-                sr_target=sr_target,
-                voice_name=_voice or None,
-                voice_created_at=_voice_created,
             )
 
         user_kwargs: dict[str, Any] = {"text": request.input or ""}
