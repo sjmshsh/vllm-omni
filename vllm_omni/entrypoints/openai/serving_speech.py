@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import soundfile as sf
@@ -146,6 +147,8 @@ _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
 _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 256 * 1024 * 1024
+_REF_AUDIO_PATH_HASH_SENTINEL_BYTES = 8192
+_REF_AUDIO_PATH_HASH_MEMO_MAX_ITEMS = 1024
 _HIGGS_V3_REF_CODE_CACHE_MAX_ENTRIES = 256
 _HIGGS_V3_REF_CODE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _QWEN3_TTS_REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
@@ -323,6 +326,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._ref_audio_resolve_cache_bytes = 0
         self._ref_audio_resolve_cache_max_entries = _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES
         self._ref_audio_resolve_cache_max_bytes = _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES
+        self._ref_audio_path_hash_memo: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._ref_audio_model_artifact_ready: set[str] = set()
         self._request_ref_audio_artifact_keys: dict[str, str] = {}
         self._higgs_audio_v3_ref_code_cache: OrderedDict[str, tuple[torch.Tensor, int]] = OrderedDict()
@@ -2439,6 +2443,142 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
+    def _allowed_ref_audio_file_path(self, ref_audio_str: str) -> Path | None:
+        parsed = urlparse(ref_audio_str)
+        if parsed.scheme.lower() == "file":
+            if parsed.netloc not in ("", "localhost"):
+                return None
+            raw_path = unquote(parsed.path)
+        elif not parsed.scheme:
+            raw_path = ref_audio_str
+        else:
+            return None
+
+        if not raw_path:
+            return None
+        try:
+            file_path = Path(raw_path).expanduser()
+        except (OSError, ValueError):
+            return None
+
+        if self._diffusion_mode:
+            return None
+        allowed = getattr(self.model_config, "allowed_local_media_path", None)
+        if not allowed:
+            return None
+        if isinstance(allowed, (list, tuple, set)):
+            allowed_paths = allowed
+        else:
+            allowed_paths = str(allowed).split(os.pathsep)
+
+        for allowed_path in allowed_paths:
+            if not allowed_path:
+                continue
+            if _validate_path_within_directory(
+                file_path,
+                Path(str(allowed_path)).expanduser(),
+            ):
+                return file_path
+        return None
+
+    @staticmethod
+    def _ref_audio_path_hash_memo_key(path: Path) -> tuple[str, int] | None:
+        try:
+            if not path.is_file():
+                return None
+            stat_result = path.stat()
+            memo_key = (
+                f"{path.resolve()}:"
+                f"{stat_result.st_size}:"
+                f"{stat_result.st_mtime_ns}:"
+                f"{stat_result.st_ctime_ns}"
+            )
+            return memo_key, int(stat_result.st_size)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _hash_ref_audio_path_sentinel(path: Path, file_size: int) -> str | None:
+        try:
+            chunk_size = min(_REF_AUDIO_PATH_HASH_SENTINEL_BYTES, file_size)
+            with path.open("rb") as f:
+                chunks = [f.read(chunk_size)]
+                if file_size > _REF_AUDIO_PATH_HASH_SENTINEL_BYTES:
+                    middle_offset = max((file_size - chunk_size) // 2, 0)
+                    f.seek(middle_offset)
+                    chunks.append(f.read(chunk_size))
+                if file_size > 2 * _REF_AUDIO_PATH_HASH_SENTINEL_BYTES:
+                    f.seek(max(file_size - chunk_size, 0))
+                    chunks.append(f.read(chunk_size))
+            h = hashlib.sha1()
+            for chunk in chunks:
+                h.update(chunk)
+            h.update(f"|size:{file_size}".encode("utf-8"))
+            return h.hexdigest()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _hash_ref_audio_path(path: Path) -> str | None:
+        try:
+            h = hashlib.sha1()
+            with path.open("rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            return h.hexdigest()
+        except OSError:
+            return None
+
+    def _local_ref_audio_resolve_cache_key(self, path: Path) -> str | None:
+        memo = self._ref_audio_path_hash_memo_key(path)
+        if memo is None:
+            return None
+        memo_key, file_size = memo
+        if file_size > self._ref_audio_resolve_cache_max_bytes:
+            return None
+
+        sentinel = self._hash_ref_audio_path_sentinel(path, file_size)
+        if sentinel is None:
+            return None
+
+        cached = self._ref_audio_path_hash_memo.get(memo_key)
+        if cached is not None:
+            cached_sentinel, digest = cached
+            if cached_sentinel == sentinel:
+                self._ref_audio_path_hash_memo.move_to_end(memo_key)
+                return f"file:{digest}"
+            self._ref_audio_path_hash_memo.pop(memo_key, None)
+
+        digest = self._hash_ref_audio_path(path)
+        if digest is None:
+            return None
+        if self._ref_audio_path_hash_memo_key(path) == memo:
+            self._ref_audio_path_hash_memo[memo_key] = (sentinel, digest)
+            self._ref_audio_path_hash_memo.move_to_end(memo_key)
+            while (
+                len(self._ref_audio_path_hash_memo)
+                > _REF_AUDIO_PATH_HASH_MEMO_MAX_ITEMS
+            ):
+                self._ref_audio_path_hash_memo.popitem(last=False)
+        return f"file:{digest}"
+
+    def _ref_audio_resolve_cache_key(self, ref_audio_str: str) -> str | None:
+        parsed = urlparse(ref_audio_str)
+        scheme = parsed.scheme.lower()
+        if scheme == "data":
+            return hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
+        if scheme in ("http", "https"):
+            # Remote resources can change behind a stable URL.
+            return None
+
+        file_path = self._allowed_ref_audio_file_path(ref_audio_str)
+        if file_path is None:
+            return None
+        return self._local_ref_audio_resolve_cache_key(file_path)
+
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
 
@@ -2446,18 +2586,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
         """
-        cache_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
-        cached = self._ref_audio_resolve_cache.get(cache_key)
-        if cached is not None:
-            self._ref_audio_resolve_cache.move_to_end(cache_key)
-            wav_list, sr, _, _ = cached
-            logger.debug(
-                "Resolved ref_audio from cache: samples=%d sr=%d duration_s=%.3f",
-                len(wav_list),
-                sr,
-                len(wav_list) / sr if sr > 0 else 0.0,
-            )
-            return wav_list, sr
+        cache_key = self._ref_audio_resolve_cache_key(ref_audio_str)
+        if cache_key is not None:
+            cached = self._ref_audio_resolve_cache.get(cache_key)
+            if cached is not None:
+                self._ref_audio_resolve_cache.move_to_end(cache_key)
+                wav_list, sr, _, _ = cached
+                logger.debug(
+                    "Resolved ref_audio from cache: samples=%d sr=%d duration_s=%.3f",
+                    len(wav_list),
+                    sr,
+                    len(wav_list) / sr if sr > 0 else 0.0,
+                )
+                return wav_list, sr
 
         # In diffusion mode, model_config may not be available
         if self._diffusion_mode:
@@ -2498,7 +2639,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sr,
             duration,
         )
-        self._put_resolved_ref_audio(cache_key, wav_list, sr, artifact_key)
+        # Recompute the key after MediaConnector reads the file so a local
+        # overwrite during decode does not populate a stale cache entry.
+        if (
+            cache_key is not None
+            and self._ref_audio_resolve_cache_key(ref_audio_str) == cache_key
+        ):
+            self._put_resolved_ref_audio(cache_key, wav_list, sr, artifact_key)
         return wav_list, sr
 
     @staticmethod
@@ -2511,11 +2658,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return h.hexdigest()
 
     def _get_resolved_ref_audio_artifact_key(self, ref_audio_str: str) -> str | None:
-        source_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
-        cached = self._ref_audio_resolve_cache.get(source_key)
+        cache_key = self._ref_audio_resolve_cache_key(ref_audio_str)
+        if cache_key is None:
+            return None
+        cached = self._ref_audio_resolve_cache.get(cache_key)
         if cached is None:
             return None
-        self._ref_audio_resolve_cache.move_to_end(source_key)
+        self._ref_audio_resolve_cache.move_to_end(cache_key)
         return cached[3]
 
     def _put_resolved_ref_audio(self, cache_key: str, wav_list: list[float], sr: int, artifact_key: str) -> None:

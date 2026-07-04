@@ -1018,6 +1018,74 @@ class TestTTSMethods:
             ref_audio
         ) == speech_server._make_ref_audio_artifact_cache_key(np.asarray(first[0], dtype=np.float32), 24000)
 
+    @pytest.mark.asyncio
+    async def test_resolve_ref_audio_file_cache_revalidates_content(
+        self,
+        speech_server,
+        tmp_path: Path,
+        mocker: MockerFixture,
+    ):
+        ref_path = tmp_path / "speaker.wav"
+        ref_path.write_bytes(b"a")
+        ref_audio = ref_path.as_uri()
+        speech_server.model_config.allowed_local_media_path = str(tmp_path)
+        speech_server.model_config.allowed_media_domains = None
+        calls = 0
+
+        async def fake_fetch_audio_async(*_args):
+            nonlocal calls
+            calls += 1
+            value = ref_path.read_bytes()[0] / 255.0
+            return np.full(24000, value, dtype=np.float32), 24000
+
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.MediaConnector.fetch_audio_async",
+            side_effect=fake_fetch_audio_async,
+        )
+
+        first = await speech_server._resolve_ref_audio(ref_audio)
+        second = await speech_server._resolve_ref_audio(ref_audio)
+
+        assert calls == 1
+        assert first[0] is second[0]
+        assert first[0][0] == pytest.approx(ord("a") / 255.0)
+
+        ref_path.write_bytes(b"b")
+        third = await speech_server._resolve_ref_audio(ref_audio)
+
+        assert calls == 2
+        assert third[0] is not first[0]
+        assert third[0][0] == pytest.approx(ord("b") / 255.0)
+
+    @pytest.mark.asyncio
+    async def test_resolve_ref_audio_http_bypasses_resolve_cache(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        ref_audio = "https://example.com/speaker.wav"
+        speech_server.model_config.allowed_local_media_path = ""
+        speech_server.model_config.allowed_media_domains = None
+        calls = 0
+
+        async def fake_fetch_audio_async(*_args):
+            nonlocal calls
+            calls += 1
+            return np.full(24000, calls / 10.0, dtype=np.float32), 24000
+
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.MediaConnector.fetch_audio_async",
+            side_effect=fake_fetch_audio_async,
+        )
+
+        first = await speech_server._resolve_ref_audio(ref_audio)
+        second = await speech_server._resolve_ref_audio(ref_audio)
+
+        assert calls == 2
+        assert first[0][0] == pytest.approx(0.1)
+        assert second[0][0] == pytest.approx(0.2)
+        assert speech_server._get_resolved_ref_audio_artifact_key(ref_audio) is None
+
     def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):
         """Precomputed Qwen3 voices are reusable by name without per-request ref_audio."""
         speech_server._tts_model_type = "qwen3_tts"
