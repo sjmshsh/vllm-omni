@@ -69,6 +69,10 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.reference_cache_key import (
+    data_uri_content_key,
+    reference_path_cache_key,
+)
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
@@ -2496,8 +2500,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Delegates to upstream vLLM's MediaConnector which handles http(s)
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
+
+        The resolve cache is keyed by *content* whenever the locator exposes
+        content cheaply: local files use a stat/sentinel/xxh3 chain and
+        ``data:`` URIs use an xxh3 of the decoded payload. Http(s) URLs fall
+        back to hashing the raw locator string, which remains best-effort
+        and assumes URL contents are stable during the server lifetime.
         """
-        cache_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
+        cache_key = self._ref_audio_source_cache_key(ref_audio_str)
         cached = self._ref_audio_resolve_cache.get(cache_key)
         if cached is not None:
             self._ref_audio_resolve_cache.move_to_end(cache_key)
@@ -2562,12 +2572,46 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return h.hexdigest()
 
     def _get_resolved_ref_audio_artifact_key(self, ref_audio_str: str) -> str | None:
-        source_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
+        source_key = self._ref_audio_source_cache_key(ref_audio_str)
         cached = self._ref_audio_resolve_cache.get(source_key)
         if cached is None:
             return None
         self._ref_audio_resolve_cache.move_to_end(source_key)
         return cached[3]
+
+    @staticmethod
+    def _ref_audio_source_cache_key(ref_audio_str: str) -> str:
+        """Return a content-aware cache key for a ``ref_audio`` locator.
+
+        Strategy (first non-empty result wins):
+
+        * ``data:`` URIs are keyed by the xxh3 of their decoded payload, so
+          two requests carrying identical inline audio share the cache.
+        * Local paths and ``file://`` locators are keyed by
+          ``reference_path_cache_key`` (stat memo + head/mid/tail sentinel +
+          full-content xxh3, ``trust_stat=False``). This detects overwrites
+          that reuse the same path and prevents stale-hit bugs described in
+          ``issue_moss_ref_audio_resolve_cache_stale.md``.
+        * All other inputs (http(s) URLs, opaque strings) fall back to a
+          sha1 of the raw locator, matching the previous best-effort
+          behaviour.
+        """
+        if ref_audio_str.startswith("data:"):
+            content_key = data_uri_content_key(ref_audio_str)
+            if content_key is not None:
+                return f"src:{content_key}"
+
+        candidate_path: str | None = None
+        if ref_audio_str.startswith("file://"):
+            candidate_path = ref_audio_str[len("file://"):]
+        elif "://" not in ref_audio_str:
+            candidate_path = ref_audio_str
+        if candidate_path:
+            file_key = reference_path_cache_key(candidate_path)
+            if file_key is not None:
+                return f"src:{file_key}"
+
+        return f"str:{hashlib.sha1(ref_audio_str.encode('utf-8')).hexdigest()}"
 
     def _put_resolved_ref_audio(self, cache_key: str, wav_list: list[float], sr: int, artifact_key: str) -> None:
         if self._ref_audio_resolve_cache_max_entries <= 0 or self._ref_audio_resolve_cache_max_bytes <= 0:

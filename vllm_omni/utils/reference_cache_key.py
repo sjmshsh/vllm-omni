@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 
 import numpy as np
 import torch
@@ -24,6 +26,13 @@ def _hash_joined(parts: list[str]) -> str:
 
 def hash_bytes(payload: bytes | bytearray | memoryview) -> str:
     return xxhash.xxh3_64(payload).hexdigest()
+
+
+def hash_waveform(wav: torch.Tensor, sample_rate: int) -> str:
+    """Generate a content key for a decoded waveform plus sample-rate metadata."""
+    cpu = wav.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    meta = f"sr:{int(sample_rate)}|shape:{tuple(cpu.shape)}"
+    return f"wav:{meta}:{hash_bytes(cpu.numpy().tobytes())}"
 
 
 def hash_file_sampled(
@@ -125,11 +134,6 @@ def _put_reference_path_hash(memo_key: str, sentinel: str, digest: str) -> None:
 def reference_path_cache_key(
     path_like: str | Path, *, trust_stat: bool = False
 ) -> str | None:
-    # Memoized full-content hash; the stat tuple skips rereads of stable files.
-    # Note(Jiaxin): trust_stat (opt-in, from #740) trusts the (size,mtime,ctime)
-    # stat tuple and skips the sentinel byte-read on memo hits; the accepted gap
-    # is same-size+mtime+ctime-with-different-content (reachable only by clock
-    # rollback). Default False keeps Higgs's sentinel path; keys are identical.
     path = Path(str(path_like)).expanduser()
     memo = _reference_path_hash_memo_key(path)
     if memo is None:
@@ -158,6 +162,35 @@ def reference_path_cache_key(
         # Always store the sentinel so default callers still validate this entry.
         _put_reference_path_hash(memo_key, sentinel, digest)
     return f"file:{digest}"
+
+
+def data_uri_content_key(uri: str) -> str | None:
+    """Compute a content-addressed cache key for a ``data:`` URI.
+
+    The payload is decoded (base64 or percent-encoded) and hashed with
+    ``xxh3_64`` so that two ``data:`` URIs pointing at the same bytes share
+    the same key even if the media type or attribute ordering differs.
+
+    Returns ``None`` when ``uri`` is not a well-formed ``data:`` URI or when
+    the payload cannot be decoded. Callers should fall back to a locator
+    hash in that case.
+    """
+    if not isinstance(uri, str) or not uri.startswith("data:"):
+        return None
+    try:
+        header, _, payload = uri[len("data:"):].partition(",")
+    except ValueError:
+        return None
+    if not payload:
+        return None
+    is_base64 = any(part.strip().lower() == "base64" for part in header.split(";"))
+    try:
+        raw = base64.b64decode(payload, validate=False) if is_base64 else unquote_to_bytes(payload)
+    except (binascii.Error, ValueError):
+        return None
+    if not raw:
+        return None
+    return f"bytes:{hash_bytes(raw)}"
 
 
 def hash_media_item(item: Any) -> str | None:

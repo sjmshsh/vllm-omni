@@ -38,7 +38,7 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.utils.reference_cache_key import hash_bytes
+from vllm_omni.utils.reference_cache_key import hash_waveform
 
 logger = init_logger(__name__)
 
@@ -87,17 +87,6 @@ def _as_waveform_tensor(wav_list: Any) -> torch.Tensor:
             f"reference audio must be 1D or 2D, got shape {tuple(wav.shape)}"
         )
     return wav.contiguous()
-
-
-def _waveform_content_key(wav: torch.Tensor, sample_rate: int) -> str:
-    """Content-hash a decoded waveform plus its sample-rate metadata.
-
-    Uses ``xxh3_64`` (via the shared ``hash_bytes`` helper) so 100-second
-    references stay well under a millisecond of hashing cost.
-    """
-    cpu = wav.detach().to(device="cpu", dtype=torch.float32).contiguous()
-    meta = f"sr:{int(sample_rate)}|shape:{tuple(cpu.shape)}"
-    return f"wav:{meta}:{hash_bytes(cpu.numpy().tobytes())}"
 
 
 def _namespace_key(
@@ -468,6 +457,7 @@ class _CachedReferenceEncoder:
         self._misses = 0
         self._merged = 0
         self._last_log_time = 0.0
+        self._leader_tasks: set[asyncio.Task[None]] = set()
 
     async def encode_waveform(
         self,
@@ -502,39 +492,91 @@ class _CachedReferenceEncoder:
             return _return_codes(cached)
 
         if follower_future is not None:
-            try:
-                stored = await asyncio.wait_for(
-                    asyncio.shield(asyncio.wrap_future(follower_future)),
-                    timeout=self._FOLLOWER_TIMEOUT_S,
-                )
-            except BaseException as cause:
-                # Fresh exception per follower: sharing one exception object
-                # lets concurrent re-raises corrupt the traceback (same
-                # lesson as ``_set_fresh_exception``).
-                raise RuntimeError(
-                    f"reference encode failed for {desc}: {cause}"
-                ) from cause
-            return _return_codes(stored)
+            return await self._await_stored_codes(
+                follower_future, desc=desc, wrap_failures=True
+            )
 
         # Leader path.
         assert leader_future is not None
+        self._track_leader_task(
+            asyncio.create_task(
+                self._run_leader_encode(
+                    cache_key=cache_key,
+                    wav=wav,
+                    sample_rate=sample_rate,
+                    sr_target=sr_target,
+                    n_vq=n_vq,
+                    leader_future=leader_future,
+                )
+            )
+        )
+        return await self._await_stored_codes(
+            leader_future, desc=desc, wrap_failures=False
+        )
+
+    def _track_leader_task(self, task: asyncio.Task[None]) -> None:
+        self._leader_tasks.add(task)
+        task.add_done_callback(self._leader_tasks.discard)
+
+    async def _run_leader_encode(
+        self,
+        *,
+        cache_key: str,
+        wav: torch.Tensor,
+        sample_rate: int,
+        sr_target: int,
+        n_vq: int,
+        leader_future: concurrent.futures.Future,
+    ) -> None:
         try:
             prepared = _prepare_waveform(wav, sample_rate, sr_target)
             result = await self._encoder.encode(
                 prepared, sample_rate=sr_target, n_vq=n_vq
             )
             stored = _stored_codes(result)
-        except BaseException as exc:
+        except asyncio.CancelledError as exc:
             with self._lock:
                 self._inflight.pop(cache_key, None)
-            leader_future.set_exception(exc)
+            if not leader_future.done():
+                leader_future.set_exception(exc)
             raise
+        except Exception as exc:
+            with self._lock:
+                self._inflight.pop(cache_key, None)
+            if not leader_future.done():
+                leader_future.set_exception(exc)
+            return
 
         with self._lock:
             self._put_locked(cache_key, stored)
             self._inflight.pop(cache_key, None)
-        leader_future.set_result(stored)
+        if not leader_future.done():
+            leader_future.set_result(stored)
         self._maybe_log_stats()
+
+    async def _await_stored_codes(
+        self,
+        future: concurrent.futures.Future,
+        *,
+        desc: str,
+        wrap_failures: bool,
+    ) -> torch.Tensor:
+        try:
+            stored = await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(future)),
+                timeout=self._FOLLOWER_TIMEOUT_S,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as cause:
+            if wrap_failures:
+                # Fresh exception per follower: sharing one exception object
+                # lets concurrent re-raises corrupt the traceback (same
+                # lesson as ``_set_fresh_exception``).
+                raise RuntimeError(
+                    f"reference encode failed for {desc}: {cause}"
+                ) from cause
+            raise
         return _return_codes(stored)
 
     def _put_locked(self, key: str, tensor: torch.Tensor) -> None:
@@ -619,6 +661,7 @@ class MossTTSReferenceEncoder:
         self._variant = str(variant)
         self._n_vq = int(n_vq)
         self._sr_target = int(sr_target)
+        self._closed_stats: dict[str, Any] | None = None
         self._batched = _BatchedReferenceEncoder(
             processor,
             max_batch_size=max_batch_size,
@@ -665,7 +708,7 @@ class MossTTSReferenceEncoder:
         _BatchedReferenceEncoder.check_reference_duration(wav, int(sample_rate))
 
         cache_key = _namespace_key(
-            _waveform_content_key(wav, int(sample_rate)),
+            hash_waveform(wav, int(sample_rate)),
             variant=self._variant,
             n_vq=self._n_vq,
             sr_target=self._sr_target,
@@ -692,11 +735,15 @@ class MossTTSReferenceEncoder:
         return _return_codes(codes)
 
     def close(self, *, join_timeout_s: float = 5.0) -> None:
+        if self._closed_stats is None:
+            self._closed_stats = self.stats()
         self._batched.close(join_timeout_s=join_timeout_s)
         self._cached = None
 
     def stats(self) -> dict[str, Any]:
         if self._cached is None:
+            if self._closed_stats is not None:
+                return dict(self._closed_stats)
             return {
                 "hits": 0,
                 "misses": 0,

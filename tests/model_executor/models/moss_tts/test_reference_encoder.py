@@ -129,6 +129,48 @@ def test_single_flight_merges_concurrent_same_reference() -> None:
     asyncio.run(_run())
 
 
+def test_single_flight_survives_cancelled_leader() -> None:
+    async def _run() -> None:
+        processor = _FakeMossProcessor(delay_s=0.05)
+        encoder = create_reference_encoder(
+            processor,
+            variant="tts",
+            n_vq=4,
+            sr_target=24000,
+            max_batch_wait_ms=0,
+            enable_cache=True,
+        )
+        payloads = {"same": ([0.1, 0.2, 0.3, 0.4], 24000)}
+        try:
+            leader = asyncio.create_task(_encode(encoder, "same", payloads))
+            for _ in range(100):
+                stats = encoder.stats()
+                if stats["misses"] == 1 and stats["inflight"] == 1:
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                raise AssertionError("leader did not register inflight encode")
+
+            leader.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await leader
+
+            follower = await _encode(encoder, "same", payloads)
+            hit = await _encode(encoder, "same", payloads)
+        finally:
+            encoder.close()
+
+        assert torch.equal(follower, hit)
+        assert sum(len(call) for call in processor.calls) == 1
+        stats = encoder.stats()
+        assert stats["hits"] == 1
+        assert stats["misses"] == 1
+        assert stats["merged"] == 1
+        assert stats["inflight"] == 0
+
+    asyncio.run(_run())
+
+
 def test_uncached_references_are_batched_with_short_wait_window() -> None:
     async def _run() -> None:
         processor = _FakeMossProcessor()
@@ -352,4 +394,3 @@ def test_reference_encoder_rejects_long_reference_before_codec() -> None:
         assert encoder.stats()["entries"] == 0
 
     asyncio.run(_run())
-
