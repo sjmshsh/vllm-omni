@@ -193,6 +193,49 @@ def data_uri_content_key(uri: str) -> str | None:
     return f"bytes:{hash_bytes(raw)}"
 
 
+def locator_content_key(locator: str) -> str:
+    """Return a content-addressed cache key for a reference-audio *locator*.
+
+    The key is computed straight from the locator string **without decoding
+    the audio**, so a cache lookup can happen before the (expensive) resolve +
+    codec-encode work. Strategy (first non-empty result wins):
+
+    * ``data:`` URIs are keyed by the xxh3 of their decoded payload, so two
+      requests carrying identical inline audio share the key even if the media
+      type or attribute ordering differs.
+    * Local paths and ``file://`` locators are keyed by
+      :func:`reference_path_cache_key` (stat memo + head/mid/tail sentinel +
+      full-content xxh3, ``trust_stat=False``), which detects overwrites that
+      reuse the same path.
+    * Everything else (http(s) URLs, opaque strings) falls back to a hash of
+      the raw locator. This is best-effort and assumes the locator's contents
+      are stable for the server lifetime.
+
+    Unlike hashing the decoded waveform, every branch here is cheap on a cache
+    hit (a few KiB of file reads at most), which is what lets the reference
+    encoder skip resolve/encode entirely for a repeated speaker.
+    """
+    if not isinstance(locator, str):
+        locator = str(locator)
+
+    if locator.startswith("data:"):
+        content_key = data_uri_content_key(locator)
+        if content_key is not None:
+            return f"src:{content_key}"
+
+    candidate_path: str | None = None
+    if locator.startswith("file://"):
+        candidate_path = locator[len("file://"):]
+    elif "://" not in locator:
+        candidate_path = locator
+    if candidate_path:
+        file_key = reference_path_cache_key(candidate_path)
+        if file_key is not None:
+            return f"src:{file_key}"
+
+    return f"str:{hash_bytes(locator.encode('utf-8'))}"
+
+
 def hash_media_item(item: Any) -> str | None:
     """Generate hash for a single media item (unified logic for image/audio/video).
 

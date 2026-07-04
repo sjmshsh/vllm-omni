@@ -6,20 +6,35 @@ The serving layer owns one :class:`MossTTSReferenceEncoder` per
 ``(processor, variant, n_vq, sr_target)`` tuple. Each instance layers three
 small collaborators:
 
-* :class:`_BatchedReferenceEncoder` — a daemon worker that batches codec
-  encoder calls behind a short wait window and isolates per-item failures
-  with a per-item retry.
+* :class:`_PooledReferenceEncoder` — a small pool of daemon workers that run
+  the codec encoder. Concurrent cold encodes run in parallel (the MOSS audio
+  tokenizer sits on CPU and releases the GIL during its forward), which is
+  what the ``asyncio.to_thread`` path did before this module existed. When a
+  wait window is configured the workers additionally coalesce queued jobs into
+  a single batched forward, isolating per-item failures with a per-item retry.
 * :class:`_CachedReferenceEncoder` — a content-addressed CPU LRU that stores
   compact ``int32`` code tensors and does single-flight de-duplication so
   concurrent misses for the same audio share one real codec encode.
 * :class:`MossTTSReferenceEncoder` — the async facade used by the OpenAI
   speech serving layer.
 
-The cache key is derived from the decoded waveform returned by the serving
-layer's ``resolve_ref_audio`` helper, not from the raw request string. That
-matches vLLM-Omni's request flow: uploaded voices, data URLs, local files
-and remote URLs all become ``(wav_list, sample_rate)`` before MOSS sees
-them, so identical audio content naturally shares encoded reference codes.
+Caching is keyed off the *locator* (the ``ref_audio`` request string) via
+:func:`vllm_omni.utils.reference_cache_key.locator_content_key`, not the
+decoded waveform. The key is derived without decoding the audio, so a cache
+hit returns immediately without resolving, resampling, or re-encoding the
+reference — the expensive resolve happens only on a miss, inside the
+single-flight leader.
+
+On worker count: the audio tokenizer runs on CPU (deliberately kept off the
+GPU to spare memory next to the ~8B talker + codec) and a single codec forward
+already fans out across every core via torch's global intra-op thread pool. So
+running several encodes at once does not add real parallelism — it just makes
+them contend for the same cores and memory bandwidth, which measured *slower*
+than encoding serially on a many-core host. The default is therefore a single
+worker; ``num_workers`` (env ``MOSS_REF_AUDIO_ENCODE_WORKERS``) can be raised
+for hosts where each encode under-uses the CPU, or for a GPU codec paired with
+a non-zero wait window to coalesce forwards. The robust win here is the cache,
+not concurrency: identical/repeated speakers skip resolve + encode entirely.
 """
 
 from __future__ import annotations
@@ -38,7 +53,7 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.utils.reference_cache_key import hash_waveform
+from vllm_omni.utils.reference_cache_key import locator_content_key
 
 logger = init_logger(__name__)
 
@@ -48,12 +63,24 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MAX_BATCH_SIZE = 8
-_DEFAULT_MAX_BATCH_WAIT_MS = 4
+# CPU codec: no wait window by default so requests are not delayed waiting for
+# a batch to fill. Set a non-zero window (and it will coalesce) only when the
+# codec runs somewhere batching actually pays off, e.g. a GPU.
+_DEFAULT_MAX_BATCH_WAIT_MS = 0
 _DEFAULT_CACHE_MAX_ITEMS = 8192
 _DEFAULT_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 _CACHE_ENV_VAR = "MOSS_REF_AUDIO_CACHE"
 _CACHE_DISABLED_TOKENS = frozenset({"0", "false", "no", "off", ""})
+_ENCODE_WORKERS_ENV_VAR = "MOSS_REF_AUDIO_ENCODE_WORKERS"
+
+# Default parallel codec encodes. A single codec forward already saturates the
+# CPU via torch's shared intra-op pool, so extra workers tend to contend rather
+# than speed things up; benchmarking a many-core host showed 8 workers running
+# *slower* than 1 under high concurrency. Default to serial and let operators
+# opt into parallelism (``MOSS_REF_AUDIO_ENCODE_WORKERS``) where it pays off
+# (CPU-underutilizing encodes, or a GPU codec with a wait window).
+_DEFAULT_ENCODE_WORKERS = 1
 
 _SHUTDOWN_SENTINEL: object = object()
 
@@ -64,6 +91,26 @@ def _cache_enabled_from_env() -> bool:
     if value is None:
         return True
     return value.strip().lower() not in _CACHE_DISABLED_TOKENS
+
+
+def _encode_workers_from_env() -> int | None:
+    """Read ``MOSS_REF_AUDIO_ENCODE_WORKERS`` as an ops override (>= 1)."""
+    value = os.environ.get(_ENCODE_WORKERS_ENV_VAR)
+    if value is None:
+        return None
+    try:
+        workers = int(value.strip())
+    except ValueError:
+        logger.warning(
+            "Ignoring non-integer %s=%r", _ENCODE_WORKERS_ENV_VAR, value
+        )
+        return None
+    if workers < 1:
+        logger.warning(
+            "Ignoring %s=%r (must be >= 1)", _ENCODE_WORKERS_ENV_VAR, value
+        )
+        return None
+    return workers
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +195,7 @@ def _set_fresh_exception(
 
 
 # ---------------------------------------------------------------------------
-# Batched reference encoder (worker + queue).
+# Pooled reference encoder (worker pool + queue).
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -163,26 +210,30 @@ class _WorkerShutdown(Exception):
     """Internal signal raised inside ``_drain_batch`` on shutdown."""
 
 
-class _BatchedReferenceEncoder:
-    """Coalesce concurrent codec encodes into batched forwards.
+class _PooledReferenceEncoder:
+    """Run codec encodes on a small pool of daemon workers.
 
-    Callers submit one waveform at a time via :meth:`submit`; a single daemon
-    thread drains the queue, groups jobs by ``(sample_rate, n_vq)`` and calls
-    ``processor.encode_audios_from_wav`` on the group. Failures fall back to
-    per-item encodes so one bad waveform only fails its own future.
+    Callers submit one waveform at a time via :meth:`submit`; ``num_workers``
+    daemon threads drain the shared queue and call
+    ``processor.encode_audios_from_wav`` on the jobs they pick up. With the
+    default zero wait window each worker encodes a single job, so up to
+    ``num_workers`` encodes run in parallel. With a non-zero window a worker
+    coalesces jobs that share ``(sample_rate, n_vq)`` into one batched forward;
+    a failing batch falls back to per-item encodes so one bad waveform only
+    fails its own future.
 
     De-duplication of concurrent same-content requests is *not* handled here
     -- that responsibility lives on :class:`_CachedReferenceEncoder`, which
-    keeps this class focused on batching and error isolation.
+    keeps this class focused on parallelism, batching and error isolation.
     """
 
     #: Reference audio longer than this is rejected before it reaches the
     #: worker; matches the Higgs cap and bounds batch-padding memory.
     MAX_REFERENCE_SECONDS = 100.0
 
-    #: A single encode batch runs in well under a second on GPU; a result
-    #: this late means the worker died or wedged, so fail the request
-    #: instead of hanging the request slot forever.
+    #: A single encode runs in well under a second; a result this late means
+    #: the worker died or wedged, so fail the request instead of hanging the
+    #: request slot forever.
     ENCODE_TIMEOUT_S = 120.0
 
     def __init__(
@@ -191,6 +242,7 @@ class _BatchedReferenceEncoder:
         *,
         max_batch_size: int = _DEFAULT_MAX_BATCH_SIZE,
         max_batch_wait_ms: int = _DEFAULT_MAX_BATCH_WAIT_MS,
+        num_workers: int | None = None,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError(f"max_batch_size must be >= 1, got {max_batch_size}")
@@ -198,14 +250,27 @@ class _BatchedReferenceEncoder:
         self._processor = processor
         self._max_batch_size = int(max_batch_size)
         self._max_wait_s = max(float(max_batch_wait_ms), 0.0) / 1000.0
+        # Default to a single worker (see _DEFAULT_ENCODE_WORKERS): on the CPU
+        # codec extra workers contend rather than parallelize, and a single
+        # worker is also what lets a non-zero wait window coalesce jobs into one
+        # batched forward for a GPU codec.
+        if num_workers is None:
+            num_workers = _DEFAULT_ENCODE_WORKERS
+        if num_workers < 1:
+            raise ValueError(f"num_workers must be >= 1, got {num_workers}")
+        self._num_workers = int(num_workers)
         self._queue: queue.Queue[_EncodeJob | object] = queue.Queue()
         self._closed = threading.Event()
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name="moss-tts-ref-encode",
-            daemon=True,
-        )
-        self._worker.start()
+        self._workers = [
+            threading.Thread(
+                target=self._worker_loop,
+                name=f"moss-tts-ref-encode-{index}",
+                daemon=True,
+            )
+            for index in range(self._num_workers)
+        ]
+        for worker in self._workers:
+            worker.start()
 
     # -- Public API ---------------------------------------------------------
 
@@ -263,10 +328,14 @@ class _BatchedReferenceEncoder:
         if self._closed.is_set():
             return
         self._closed.set()
-        self._queue.put(_SHUTDOWN_SENTINEL)
-        if self._worker.is_alive():
-            self._worker.join(timeout=float(join_timeout_s))
-        # Fail anything that raced past the sentinel; harmless if empty.
+        # One sentinel per worker so each drains and exits.
+        for _ in self._workers:
+            self._queue.put(_SHUTDOWN_SENTINEL)
+        deadline = time.monotonic() + float(join_timeout_s)
+        for worker in self._workers:
+            if worker.is_alive():
+                worker.join(timeout=max(deadline - time.monotonic(), 0.0))
+        # Fail anything that raced past the sentinels; harmless if empty.
         self._fail_queued_jobs("MOSS-TTS reference encoder is closed")
 
     # -- Worker plumbing ----------------------------------------------------
@@ -292,7 +361,7 @@ class _BatchedReferenceEncoder:
             except BaseException as exc:
                 # Should never happen — ``_encode_batch`` catches internally
                 # and falls back to per-item encodes — but keep a hard net so
-                # the worker can never die and orphan every waiting future.
+                # a worker can never die and orphan every waiting future.
                 logger.exception(
                     "MOSS-TTS reference-encode worker failed a batch"
                 )
@@ -323,7 +392,8 @@ class _BatchedReferenceEncoder:
                 break
 
             if item is _SHUTDOWN_SENTINEL:
-                # Put the sentinel back so the outer loop sees it next.
+                # Put the sentinel back so a sibling worker (or this worker's
+                # next loop) sees it and shuts down too.
                 self._queue.put(_SHUTDOWN_SENTINEL)
                 break
             batch.append(item)  # type: ignore[arg-type]
@@ -354,7 +424,8 @@ class _BatchedReferenceEncoder:
                 )
         except BaseException:
             # A single bad ref shouldn't take down the whole batch — retry
-            # each item on its own so failures stay isolated.
+            # each item on its own so failures stay isolated. (Only reachable
+            # when a wait window coalesced more than one job.)
             logger.exception(
                 "MOSS-TTS batched reference encode failed "
                 "(batch=%d, sr=%d, n_vq=%d); retrying per item",
@@ -412,16 +483,21 @@ class _BatchedReferenceEncoder:
 
 
 # ---------------------------------------------------------------------------
-# LRU + single-flight cache in front of the batched encoder.
+# LRU + single-flight cache in front of the pooled encoder.
 # ---------------------------------------------------------------------------
 
 class _CachedReferenceEncoder:
-    """CPU-int32 LRU cache and single-flight in front of a batched encoder.
+    """CPU-int32 LRU cache and single-flight in front of a pooled encoder.
 
     Every path (miss, hit, follower) returns an *independent* CPU long tensor
     so downstream code can freely mutate it without corrupting a shared cache
     entry. Codes are stored as ``int32`` (lossless for typical codebook
     values in ``[0, 1023]``) to keep the byte budget small.
+
+    The cache is fed by an async ``encode_fn`` callback, not a resolved
+    waveform: the leader runs ``encode_fn`` (resolve + prepare + codec) exactly
+    once per key, so a cache hit or a merged follower never resolves the
+    reference at all.
     """
 
     #: Cadence of the periodic stats log; class attr so it is easy to tune.
@@ -429,11 +505,10 @@ class _CachedReferenceEncoder:
 
     #: Followers on a merged encode wait a little longer than the leader's
     #: hard timeout so a slow-but-not-hung leader still delivers a result.
-    _FOLLOWER_TIMEOUT_S = _BatchedReferenceEncoder.ENCODE_TIMEOUT_S + 10.0
+    _FOLLOWER_TIMEOUT_S = _PooledReferenceEncoder.ENCODE_TIMEOUT_S + 10.0
 
     def __init__(
         self,
-        encoder: _BatchedReferenceEncoder,
         *,
         max_items: int = _DEFAULT_CACHE_MAX_ITEMS,
         max_bytes: int = _DEFAULT_CACHE_MAX_BYTES,
@@ -446,7 +521,6 @@ class _CachedReferenceEncoder:
         if max_bytes < 1:
             raise ValueError(f"max_bytes must be >= 1, got {max_bytes}")
 
-        self._encoder = encoder
         self._max_items = int(max_items)
         self._max_bytes = int(max_bytes)
         self._lock = threading.Lock()
@@ -459,16 +533,19 @@ class _CachedReferenceEncoder:
         self._last_log_time = 0.0
         self._leader_tasks: set[asyncio.Task[None]] = set()
 
-    async def encode_waveform(
+    async def encode(
         self,
-        *,
         cache_key: str,
-        wav: torch.Tensor,
-        sample_rate: int,
-        sr_target: int,
-        n_vq: int,
+        encode_fn: Callable[[], Awaitable[torch.Tensor]],
+        *,
         desc: str,
     ) -> torch.Tensor:
+        """Return codes for ``cache_key``, running ``encode_fn`` at most once.
+
+        ``encode_fn`` is an async callable that produces the raw code tensor
+        (typically: resolve the locator, prepare the waveform, run the codec).
+        It runs only on a genuine miss, inside the single-flight leader.
+        """
         cached: torch.Tensor | None = None
         follower_future: concurrent.futures.Future | None = None
         leader_future: concurrent.futures.Future | None = None
@@ -496,16 +573,15 @@ class _CachedReferenceEncoder:
                 follower_future, desc=desc, wrap_failures=True
             )
 
-        # Leader path.
+        # Leader path. The encode runs in an independent task so that
+        # cancelling *this* caller does not cancel the shared encode — a
+        # follower that arrives before it finishes still merges onto it.
         assert leader_future is not None
         self._track_leader_task(
             asyncio.create_task(
                 self._run_leader_encode(
                     cache_key=cache_key,
-                    wav=wav,
-                    sample_rate=sample_rate,
-                    sr_target=sr_target,
-                    n_vq=n_vq,
+                    encode_fn=encode_fn,
                     leader_future=leader_future,
                 )
             )
@@ -522,17 +598,11 @@ class _CachedReferenceEncoder:
         self,
         *,
         cache_key: str,
-        wav: torch.Tensor,
-        sample_rate: int,
-        sr_target: int,
-        n_vq: int,
+        encode_fn: Callable[[], Awaitable[torch.Tensor]],
         leader_future: concurrent.futures.Future,
     ) -> None:
         try:
-            prepared = _prepare_waveform(wav, sample_rate, sr_target)
-            result = await self._encoder.encode(
-                prepared, sample_rate=sr_target, n_vq=n_vq
-            )
+            result = await encode_fn()
             stored = _stored_codes(result)
         except asyncio.CancelledError as exc:
             with self._lock:
@@ -540,7 +610,7 @@ class _CachedReferenceEncoder:
             if not leader_future.done():
                 leader_future.set_exception(exc)
             raise
-        except Exception as exc:
+        except BaseException as exc:
             with self._lock:
                 self._inflight.pop(cache_key, None)
             if not leader_future.done():
@@ -638,11 +708,11 @@ class _CachedReferenceEncoder:
 # ---------------------------------------------------------------------------
 
 class MossTTSReferenceEncoder:
-    """Async facade tying together preprocessing, batching and caching.
+    """Async facade tying together preprocessing, pooling and caching.
 
     One instance is held per ``(processor, variant, n_vq, sr_target)`` tuple
-    by the serving layer so the daemon batching thread and content-addressed
-    LRU are shared across every request that reuses that MOSS-TTS variant.
+    by the serving layer so the daemon worker pool and content-addressed LRU
+    are shared across every request that reuses that MOSS-TTS variant.
     """
 
     def __init__(
@@ -654,6 +724,7 @@ class MossTTSReferenceEncoder:
         sr_target: int,
         max_batch_size: int = _DEFAULT_MAX_BATCH_SIZE,
         max_batch_wait_ms: int = _DEFAULT_MAX_BATCH_WAIT_MS,
+        num_workers: int | None = None,
         cache_max_items: int = _DEFAULT_CACHE_MAX_ITEMS,
         cache_max_bytes: int = _DEFAULT_CACHE_MAX_BYTES,
         enable_cache: bool | None = None,
@@ -662,10 +733,11 @@ class MossTTSReferenceEncoder:
         self._n_vq = int(n_vq)
         self._sr_target = int(sr_target)
         self._closed_stats: dict[str, Any] | None = None
-        self._batched = _BatchedReferenceEncoder(
+        self._pooled = _PooledReferenceEncoder(
             processor,
             max_batch_size=max_batch_size,
             max_batch_wait_ms=max_batch_wait_ms,
+            num_workers=num_workers,
         )
 
         cache_on = (
@@ -676,7 +748,6 @@ class MossTTSReferenceEncoder:
         if cache_on:
             self._cached: _CachedReferenceEncoder | None = (
                 _CachedReferenceEncoder(
-                    self._batched,
                     max_items=cache_max_items,
                     max_bytes=cache_max_bytes,
                 )
@@ -684,7 +755,7 @@ class MossTTSReferenceEncoder:
         else:
             logger.info(
                 "MOSS-TTS reference-audio cache disabled via %s; "
-                "batching only",
+                "pooled encoding only",
                 _CACHE_ENV_VAR,
             )
             self._cached = None
@@ -695,49 +766,49 @@ class MossTTSReferenceEncoder:
         *,
         resolve_ref_audio: Callable[[str], Awaitable[tuple[list, int]]],
     ) -> torch.Tensor:
-        """Resolve, hash, and encode a reference audio into MOSS codes.
+        """Resolve, encode, and cache a reference audio into MOSS codes.
+
+        The cache key is derived from the ``ref_str`` locator up front
+        (:func:`locator_content_key`), so a cache hit returns without ever
+        calling ``resolve_ref_audio``. On a miss the single-flight leader
+        resolves, resamples and runs the codec exactly once.
 
         The returned tensor is a fresh CPU ``torch.long`` clone regardless of
         cache temperature, so the caller may mutate it freely.
         """
-        wav_list, sample_rate = await resolve_ref_audio(ref_str)
-        wav = _as_waveform_tensor(wav_list)
-
-        # Reject over-long refs *before* we hash or enqueue — a 100+ s ref
-        # must never reach the cache or the inflight table.
-        _BatchedReferenceEncoder.check_reference_duration(wav, int(sample_rate))
-
         cache_key = _namespace_key(
-            hash_waveform(wav, int(sample_rate)),
+            locator_content_key(ref_str),
             variant=self._variant,
             n_vq=self._n_vq,
             sr_target=self._sr_target,
         )
         desc = repr(str(ref_str)[:64])
 
-        if self._cached is not None:
-            return await self._cached.encode_waveform(
-                cache_key=cache_key,
-                wav=wav,
-                sample_rate=int(sample_rate),
-                sr_target=self._sr_target,
-                n_vq=self._n_vq,
-                desc=desc,
+        async def _encode_fn() -> torch.Tensor:
+            wav_list, sample_rate = await resolve_ref_audio(ref_str)
+            wav = _as_waveform_tensor(wav_list)
+            # Reject over-long refs before the codec (and, on the cache path,
+            # before anything is stored) — a 100+ s ref must never be admitted.
+            _PooledReferenceEncoder.check_reference_duration(
+                wav, int(sample_rate)
+            )
+            prepared = _prepare_waveform(wav, int(sample_rate), self._sr_target)
+            return await self._pooled.encode(
+                prepared, sample_rate=self._sr_target, n_vq=self._n_vq
             )
 
+        if self._cached is not None:
+            return await self._cached.encode(cache_key, _encode_fn, desc=desc)
+
         # Cache-off path: no LRU, no dedup — concurrent same-content requests
-        # will each run through the codec (matches sglang's behaviour when
+        # each run through the codec (matches sglang's behaviour when
         # ``MOSS_REF_AUDIO_CACHE`` is disabled).
-        prepared = _prepare_waveform(wav, int(sample_rate), self._sr_target)
-        codes = await self._batched.encode(
-            prepared, sample_rate=self._sr_target, n_vq=self._n_vq
-        )
-        return _return_codes(codes)
+        return _return_codes(await _encode_fn())
 
     def close(self, *, join_timeout_s: float = 5.0) -> None:
         if self._closed_stats is None:
             self._closed_stats = self.stats()
-        self._batched.close(join_timeout_s=join_timeout_s)
+        self._pooled.close(join_timeout_s=join_timeout_s)
         self._cached = None
 
     def stats(self) -> dict[str, Any]:
@@ -768,10 +839,13 @@ def create_reference_encoder(
     sr_target: int,
     max_batch_size: int = _DEFAULT_MAX_BATCH_SIZE,
     max_batch_wait_ms: int = _DEFAULT_MAX_BATCH_WAIT_MS,
+    num_workers: int | None = None,
     cache_max_items: int = _DEFAULT_CACHE_MAX_ITEMS,
     cache_max_bytes: int = _DEFAULT_CACHE_MAX_BYTES,
     enable_cache: bool | None = None,
 ) -> MossTTSReferenceEncoder:
+    if num_workers is None:
+        num_workers = _encode_workers_from_env()
     return MossTTSReferenceEncoder(
         processor,
         variant=variant,
@@ -779,6 +853,7 @@ def create_reference_encoder(
         sr_target=sr_target,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        num_workers=num_workers,
         cache_max_items=cache_max_items,
         cache_max_bytes=cache_max_bytes,
         enable_cache=enable_cache,

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any
 
@@ -28,6 +29,11 @@ class _FakeMossProcessor:
         self.delay_s = delay_s
         self.fail_batched = fail_batched
         self.calls: list[list[torch.Tensor]] = []
+        # Concurrency instrumentation: workers increment ``_active`` on entry so
+        # a test can prove that distinct encodes overlap (run in parallel).
+        self._active = 0
+        self._active_lock = threading.Lock()
+        self.max_active = 0
 
     def encode_audios_from_wav(
         self,
@@ -37,20 +43,29 @@ class _FakeMossProcessor:
         n_vq: int,
     ) -> list[torch.Tensor]:
         self.calls.append([wav.detach().clone() for wav in waveforms])
-        if self.delay_s:
-            time.sleep(self.delay_s)
-        if self.fail_batched and len(waveforms) > 1:
-            raise RuntimeError("batched encode failed")
+        with self._active_lock:
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+        try:
+            if self.delay_s:
+                time.sleep(self.delay_s)
+            if self.fail_batched and len(waveforms) > 1:
+                raise RuntimeError("batched encode failed")
 
-        results: list[torch.Tensor] = []
-        for wav in waveforms:
-            flat = wav.reshape(-1)
-            if flat.numel() > 0 and float(flat[0].item()) < 0:
-                raise RuntimeError("bad waveform")
-            value = int(round(float(flat.sum().item()) * 1000)) % 997
-            frames = max(1, int(wav.shape[-1]))
-            results.append(torch.full((frames, int(n_vq)), value, dtype=torch.long))
-        return results
+            results: list[torch.Tensor] = []
+            for wav in waveforms:
+                flat = wav.reshape(-1)
+                if flat.numel() > 0 and float(flat[0].item()) < 0:
+                    raise RuntimeError("bad waveform")
+                value = int(round(float(flat.sum().item()) * 1000)) % 997
+                frames = max(1, int(wav.shape[-1]))
+                results.append(
+                    torch.full((frames, int(n_vq)), value, dtype=torch.long)
+                )
+            return results
+        finally:
+            with self._active_lock:
+                self._active -= 1
 
 
 def _resolver_for(payloads: dict[str, tuple[list[float], int]]):
@@ -371,6 +386,78 @@ def test_single_flight_failure_does_not_poison_cache() -> None:
         assert stats["inflight"] == 0
 
     asyncio.run(_run())
+
+
+def test_cache_hit_skips_resolve() -> None:
+    async def _run() -> None:
+        processor = _FakeMossProcessor()
+        encoder = create_reference_encoder(
+            processor,
+            variant="tts",
+            n_vq=4,
+            sr_target=24000,
+            max_batch_wait_ms=0,
+            enable_cache=True,
+        )
+
+        resolve_calls = 0
+
+        async def _resolve(ref: str) -> tuple[list[float], int]:
+            nonlocal resolve_calls
+            resolve_calls += 1
+            await asyncio.sleep(0)
+            return [0.1, 0.2, 0.3], 24000
+
+        try:
+            first = await encoder.encode_reference_codes(
+                "spk-1", resolve_ref_audio=_resolve
+            )
+            second = await encoder.encode_reference_codes(
+                "spk-1", resolve_ref_audio=_resolve
+            )
+        finally:
+            encoder.close()
+
+        # The locator-keyed cache must serve the second call without resolving
+        # or re-encoding the reference.
+        assert resolve_calls == 1
+        assert len(processor.calls) == 1
+        assert torch.equal(first, second)
+        assert encoder.stats()["hits"] == 1
+
+    asyncio.run(_run())
+
+
+def test_distinct_references_encode_in_parallel() -> None:
+    async def _run() -> int:
+        processor = _FakeMossProcessor(delay_s=0.1)
+        encoder = create_reference_encoder(
+            processor,
+            variant="tts",
+            n_vq=2,
+            sr_target=24000,
+            max_batch_wait_ms=0,
+            num_workers=4,
+            enable_cache=False,
+        )
+        payloads = {
+            "a": ([0.1, 0.2], 24000),
+            "b": ([0.3, 0.4], 24000),
+            "c": ([0.5, 0.6], 24000),
+            "d": ([0.7, 0.8], 24000),
+        }
+        try:
+            await asyncio.gather(
+                *(_encode(encoder, ref, payloads) for ref in payloads)
+            )
+        finally:
+            encoder.close()
+        return processor.max_active
+
+    max_active = asyncio.run(_run())
+    # A single serial worker would cap observed concurrency at 1; the pool must
+    # run distinct cold encodes in parallel.
+    assert max_active >= 2
 
 
 def test_reference_encoder_rejects_long_reference_before_codec() -> None:
