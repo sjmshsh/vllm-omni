@@ -26,12 +26,14 @@ logger = init_logger(__name__)
 
 
 def _decode_codec(model: object, codes: torch.Tensor, lengths: torch.Tensor) -> MossAudioTokenizerDecoderOutput:
-    decode = getattr(model, "_decode", None)
-    if callable(decode):
-        return decode(codes, lengths)
-    decode_frame = getattr(model, "_decode_frame", None)
-    if callable(decode_frame):
-        return decode_frame(codes, lengths)
+    # Prefer the streaming decoder entry point when the codec is running inside
+    # a persistent ``codec.streaming(batch_size)`` context (v2 tokenizer); fall
+    # back to the batched offline decode otherwise. Direct attribute access +
+    # ``hasattr`` avoids ``getattr`` per project convention.
+    if hasattr(model, "_decode"):
+        return model._decode(codes, lengths)
+    if hasattr(model, "_decode_frame"):
+        return model._decode_frame(codes, lengths)
     raise AttributeError("MOSS codec model must expose _decode or _decode_frame")
 
 
@@ -234,6 +236,24 @@ class MossTTSStreamingCUDAGraphCodecWrapper:
     state unchanged.
     """
 
+    # Defensive upper bounds against a mis-configured connector (e.g. an
+    # accidentally huge ``stream_decode_cudagraph_capture_sizes``): each
+    # captured graph carries multi-GB of intermediates at
+    # ``batch_size == stream_slots``, so an unbounded set can OOM the box.
+    # Sizes exceeding ``max_frames`` are dropped with a warning; once
+    # ``max_graphs`` graphs are captured, the remaining sizes are skipped
+    # (they fall back to eager exactly like an unmatched T at replay time).
+    _DEFAULT_MAX_FRAMES: int = 128
+    _DEFAULT_MAX_GRAPHS: int = 160
+    # Aligned with SGLang-Omni's MOSS vocoder graph runner: one warm iteration
+    # is not always enough to force conv/cudnn workspace + algorithm-selection
+    # allocations out of the capture window on all GPUs, so we pay three warm
+    # iterations up front (~a few hundred ms per size, once, at startup).
+    _DEFAULT_WARMUP_ITERS: int = 3
+    # Log capture/replay stats every N steps for long-running sessions so an
+    # operator can see graph vs eager mix without waiting for ``close()``.
+    _STATS_LOG_INTERVAL: int = 2000
+
     def __init__(
         self,
         model: object,
@@ -243,17 +263,36 @@ class MossTTSStreamingCUDAGraphCodecWrapper:
         *,
         min_free_gb: float = 3.0,
         enabled: bool = True,
+        max_frames: int | None = None,
+        max_graphs: int | None = None,
+        warmup_iters: int | None = None,
     ) -> None:
         self.model = model
+        # Sort largest-first: all per-T graphs share one CUDA mempool, and
+        # capturing a larger graph *after* a smaller one grows the pool and
+        # invalidates the earlier graphs' recorded addresses (replay would
+        # segfault). Aligned with SGLang-Omni.
         self.capture_sizes = sorted({int(size) for size in capture_sizes if int(size) > 0}, reverse=True)
         self.num_quantizers = int(num_quantizers)
         self.batch_size = int(batch_size)
         self.enabled = bool(enabled)
         self.min_free_bytes = int(float(min_free_gb) * (1024**3))
+        self.max_frames = int(max_frames) if max_frames is not None else self._DEFAULT_MAX_FRAMES
+        self.max_graphs = int(max_graphs) if max_graphs is not None else self._DEFAULT_MAX_GRAPHS
+        self.warmup_iters = int(warmup_iters) if warmup_iters is not None else self._DEFAULT_WARMUP_ITERS
+        if self.max_frames < 1:
+            raise ValueError(f"max_frames must be >= 1, got {self.max_frames}")
+        if self.max_graphs < 1:
+            raise ValueError(f"max_graphs must be >= 1, got {self.max_graphs}")
+        if self.warmup_iters < 1:
+            raise ValueError(f"warmup_iters must be >= 1, got {self.warmup_iters}")
         self.graphs: dict[int, _CapturedStreamingCodecGraph] = {}
         self._warmed_up = False
         self._graph_t: Counter[int] = Counter()
         self._eager_t: Counter[int] = Counter()
+        # Total graphed+eager steps served since warmup; used to trigger the
+        # periodic stats log at ``_STATS_LOG_INTERVAL`` boundaries.
+        self._total_steps: int = 0
 
     def _enough_free_vram(self, device: torch.device) -> tuple[bool, int]:
         with torch.cuda.device(device):
@@ -265,7 +304,13 @@ class MossTTSStreamingCUDAGraphCodecWrapper:
         reset_mask = torch.ones(self.batch_size, dtype=torch.bool, device=device)
 
         def _reset(module: object) -> None:
-            state = getattr(module, "_streaming_state", None)
+            # ``_streaming_state`` is set on every StreamingModule as soon as
+            # the codec enters ``codec.streaming(batch_size)``; on non-streaming
+            # submodules the attribute simply does not exist. ``hasattr`` +
+            # direct access mirrors that and avoids ``getattr``.
+            if not hasattr(module, "_streaming_state"):
+                return
+            state = module._streaming_state
             if state is not None:
                 state.reset(reset_mask.to(state.device))
 
@@ -275,15 +320,37 @@ class MossTTSStreamingCUDAGraphCodecWrapper:
         if device.type != "cuda" or not self.enabled or self._warmed_up:
             return
 
+        # Enforce ``max_frames`` up front so oversized entries are logged once
+        # and dropped, rather than surfacing as opaque OOMs mid-capture.
+        oversized = [size for size in self.capture_sizes if size > self.max_frames]
+        if oversized:
+            logger.warning(
+                "MOSS-TTS streaming codec CUDA Graph: dropping %d capture size(s) exceeding max_frames=%d: %s",
+                len(oversized),
+                self.max_frames,
+                oversized,
+            )
+        effective_sizes = [size for size in self.capture_sizes if 1 <= size <= self.max_frames]
+
         logger.info(
-            "MOSS-TTS streaming codec CUDA Graph warmup: nq=%d batch=%d capture_sizes=%s",
+            "MOSS-TTS streaming codec CUDA Graph warmup: nq=%d batch=%d capture_sizes=%s max_frames=%d max_graphs=%d",
             self.num_quantizers,
             self.batch_size,
-            sorted(self.capture_sizes),
+            effective_sizes,
+            self.max_frames,
+            self.max_graphs,
         )
         t0 = time.perf_counter()
 
-        for size in self.capture_sizes:
+        # ``effective_sizes`` is already largest-first (inherited from
+        # ``self.capture_sizes``), which is what the shared graph pool needs.
+        for size in effective_sizes:
+            if len(self.graphs) >= self.max_graphs:
+                logger.warning(
+                    "MOSS-TTS streaming codec CUDA Graph cap max_graphs=%d reached; skipping remaining sizes.",
+                    self.max_graphs,
+                )
+                break
             enough, free = self._enough_free_vram(device)
             if not enough:
                 logger.warning(
@@ -309,7 +376,7 @@ class MossTTSStreamingCUDAGraphCodecWrapper:
         logger.info(
             "MOSS-TTS streaming codec CUDA Graph warmup complete: %d/%d captured in %.1f ms",
             len(self.graphs),
-            len(self.capture_sizes),
+            len(effective_sizes),
             elapsed_ms,
         )
 
@@ -321,14 +388,22 @@ class MossTTSStreamingCUDAGraphCodecWrapper:
         exec_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
 
         self.model._set_streaming_exec_mask(exec_mask)
+        # Side-stream warmup forces lazy allocations (cuDNN algo pick, conv
+        # workspaces, etc.) out of the capture window. A single iteration is
+        # not always enough on all GPUs, so we run ``warmup_iters`` (aligned
+        # with SGLang-Omni's default of 3).
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
             with torch.no_grad():
-                _ = self.model._decode_frame(static_codes, static_lengths)
+                for _ in range(self.warmup_iters):
+                    self.model._decode_frame(static_codes, static_lengths)
         torch.cuda.current_stream(device).wait_stream(stream)
         torch.accelerator.synchronize(device)
 
+        # Reset slots AFTER the warmup and BEFORE the capture: warmup advances
+        # per-slot streaming offset; capturing at the warmup-advanced state
+        # bakes a wrong start position (~0.4 PCM error at replay).
         self._reset_all_slots(device)
         self.model._set_streaming_exec_mask(exec_mask)
         graph = CUDAGraph()
@@ -364,13 +439,26 @@ class MossTTSStreamingCUDAGraphCodecWrapper:
         entry = self.graphs.get(int(step_t))
         if entry is None:
             self._eager_t[int(step_t)] += 1
+            self._bump_and_maybe_log_stats()
             return None
 
         self.model._set_streaming_exec_mask(exec_mask)
         entry.static_codes.copy_(codes_step)
         entry.graph.replay()
         self._graph_t[int(step_t)] += 1
+        self._bump_and_maybe_log_stats()
         return entry.static_audio, entry.static_audio_lengths
+
+    def _bump_and_maybe_log_stats(self) -> None:
+        """Increment the aggregate step counter and periodically emit stats.
+
+        Called from both the graphed and the eager-fallback branches so the
+        interval reflects total decode-steps served. A long-running session
+        would otherwise only log stats at ``close()``.
+        """
+        self._total_steps += 1
+        if self._total_steps % self._STATS_LOG_INTERVAL == 0:
+            self.log_stats()
 
     def disable(self) -> None:
         self.enabled = False
@@ -379,15 +467,20 @@ class MossTTSStreamingCUDAGraphCodecWrapper:
     def captured_sizes(self) -> list[int]:
         return sorted(self.graphs)
 
+    def has_captured(self) -> bool:
+        """True when at least one per-T graph is live and replay is possible."""
+        return self.enabled and self._warmed_up and bool(self.graphs)
+
     def log_stats(self) -> None:
         graph = sum(self._graph_t.values())
         eager = sum(self._eager_t.values())
         total = graph + eager
         if total:
             logger.info(
-                "MOSS-TTS streaming codec CUDA Graph stats: %d/%d steps graphed; graph T=%s eager T=%s",
+                "MOSS-TTS streaming codec CUDA Graph stats: %d/%d steps graphed (%.1f%%); graph T=%s eager T=%s",
                 graph,
                 total,
+                100.0 * graph / total,
                 dict(sorted(self._graph_t.items())),
                 dict(sorted(self._eager_t.items())),
             )

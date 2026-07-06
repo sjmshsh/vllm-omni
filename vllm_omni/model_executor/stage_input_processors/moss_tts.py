@@ -30,14 +30,18 @@ def _extract_audio_codes(stage_output: Any) -> torch.Tensor | None:
     if stage_output is None:
         return None
 
-    # OmniOutput
-    mm = getattr(stage_output, "multimodal_outputs", None)
-    if mm is not None:
-        codes_dict = mm.get("codes", {})
-        if isinstance(codes_dict, dict):
-            ac = codes_dict.get("audio")
-            if isinstance(ac, torch.Tensor):
-                return ac
+    # OmniOutput: ``multimodal_outputs`` is populated by the talker stages
+    # that carry codes; on stages that only produce text hidden states the
+    # attribute is not defined. ``hasattr`` + direct access avoids ``getattr``
+    # per project convention.
+    if hasattr(stage_output, "multimodal_outputs"):
+        mm = stage_output.multimodal_outputs
+        if mm is not None:
+            codes_dict = mm.get("codes", {})
+            if isinstance(codes_dict, dict):
+                ac = codes_dict.get("audio")
+                if isinstance(ac, torch.Tensor):
+                    return ac
 
     return None
 
@@ -110,7 +114,12 @@ def talker2codec_delay_async_chunk(
     Returns a dict compatible with the Stage-1 input format, or None to
     signal "not enough data yet — wait for more frames".
     """
-    req_id: str = str(getattr(request, "request_id", id(request)))
+    # ``request_id`` is set on every engine-side request; ``id(request)`` is
+    # only used as a defensive fallback for objects lacking the attribute.
+    if hasattr(request, "request_id"):
+        req_id: str = str(request.request_id)
+    else:
+        req_id = str(id(request))
     pooling_output = multimodal_output
 
     # Initialise per-request accumulation state
@@ -235,8 +244,16 @@ def talker2codec_raw_async_chunk(
     a codec chunk is ready, then forwards the chunk to Stage 1. No delay-pattern
     de-delay is applied on this path.
     """
-    external_req_id = getattr(request, "external_req_id", None)
-    req_id = str(external_req_id if external_req_id is not None else getattr(request, "request_id", id(request)))
+    # Prefer the caller-supplied external id (e.g. an OpenAI-compatible
+    # request id); fall back to the engine-assigned ``request_id`` and, as a
+    # last resort, the object identity. Direct attribute access + ``hasattr``
+    # per project convention.
+    if hasattr(request, "external_req_id") and request.external_req_id is not None:
+        req_id = str(request.external_req_id)
+    elif hasattr(request, "request_id"):
+        req_id = str(request.request_id)
+    else:
+        req_id = str(id(request))
 
     if not hasattr(transfer_manager, "code_prompt_token_ids"):
         transfer_manager.code_prompt_token_ids = defaultdict(list)
@@ -265,15 +282,22 @@ def talker2codec_raw_async_chunk(
         # long first-packet prime step and changes the decoder state relative
         # to non-streaming output.
 
-    connector = getattr(transfer_manager, "connector", None)
-    raw_cfg = getattr(connector, "config", {}) or {}
+    # ``connector`` is attached to the transfer manager by the stage runner;
+    # a bare-bones test harness may skip it, so ``hasattr`` guards the read.
+    if hasattr(transfer_manager, "connector") and transfer_manager.connector is not None:
+        connector = transfer_manager.connector
+        raw_cfg = connector.config if hasattr(connector, "config") and connector.config is not None else {}
+    else:
+        raw_cfg = {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     cfg = cfg if isinstance(cfg, dict) else {}
     chunk_frames = int(cfg.get("codec_chunk_frames", 15) or 15)
     configured_initial_chunk_frames = int(cfg.get("initial_codec_chunk_frames") or 0)
     initial_chunk_frames = configured_initial_chunk_frames
 
-    additional_information = getattr(request, "additional_information", None)
+    # ``additional_information`` carries per-request overrides; not every
+    # request populates it, so ``hasattr`` guards the read.
+    additional_information = request.additional_information if hasattr(request, "additional_information") else None
     if (
         additional_information is not None
         and hasattr(additional_information, "entries")
