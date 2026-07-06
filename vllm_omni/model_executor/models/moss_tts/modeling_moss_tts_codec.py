@@ -43,6 +43,7 @@ class _MossCodecStreamSession:
         codec: nn.Module,
         *,
         stream_slots: int,
+        offline_slots: int,
         n_vq: int,
         enable_cuda_graph: bool = False,
         cuda_graph_capture_sizes: list[int] | None = None,
@@ -50,7 +51,8 @@ class _MossCodecStreamSession:
     ) -> None:
         self._codec = codec
         self._stream_slots = int(stream_slots)
-        self._batch_size = self._stream_slots
+        self._offline_slots = max(1, int(offline_slots))
+        self._batch_size = self._stream_slots + self._offline_slots
         self._n_vq = int(n_vq)
         self._device = next(codec.parameters()).device
         self._free_stream_slots = list(range(self._stream_slots))
@@ -180,6 +182,56 @@ class _MossCodecStreamSession:
             out[slot] = wav.contiguous()
         return out
 
+    @torch.no_grad()
+    def decode_offline(
+        self,
+        codes_list: list[torch.Tensor],
+        *,
+        max_step_frames: int,
+    ) -> list[torch.Tensor]:
+        """Decode complete utterances through slots reserved for offline work."""
+        if not codes_list:
+            return []
+        max_step_frames = max(1, int(max_step_frames))
+        wavs: list[torch.Tensor] = []
+        for group_start in range(0, len(codes_list), self._offline_slots):
+            group = codes_list[group_start : group_start + self._offline_slots]
+            slots = [self._stream_slots + i for i in range(len(group))]
+            self.reset_slots(slots)
+            cursors = [0] * len(group)
+            chunks: list[list[torch.Tensor]] = [[] for _ in group]
+
+            try:
+                while True:
+                    remaining = [int(codes.shape[1]) - cursor for codes, cursor in zip(group, cursors)]
+                    positive = [frames for frames in remaining if frames > 0]
+                    if not positive:
+                        break
+                    step_t = (
+                        max_step_frames if any(frames >= max_step_frames for frames in positive) else min(positive)
+                    )
+                    plan = {
+                        slots[index]: group[index][:, cursors[index] : cursors[index] + step_t]
+                        for index, frames in enumerate(remaining)
+                        if frames >= step_t
+                    }
+                    decoded = self.step(plan)
+                    for index, slot in enumerate(slots):
+                        if slot not in plan:
+                            continue
+                        wav = decoded.get(slot)
+                        if wav is not None:
+                            chunks[index].append(wav)
+                        cursors[index] += step_t
+            finally:
+                self.reset_slots(slots)
+            for item_chunks in chunks:
+                if item_chunks:
+                    wavs.append(torch.cat(item_chunks, dim=-1) if len(item_chunks) > 1 else item_chunks[0])
+                else:
+                    wavs.append(torch.zeros((1, 0), dtype=torch.float32))
+        return wavs
+
 
 class MossTTSCodecDecoder(nn.Module):
     """Stage-1 decoder for all MOSS-TTS variants.
@@ -231,6 +283,7 @@ class MossTTSCodecDecoder(nn.Module):
         self._sr_tensor = torch.tensor(self._OUTPUT_SAMPLE_RATE, dtype=torch.int32)
         self._stream_session: _MossCodecStreamSession | None = None
         self._stream_slots: int = self._connector_int("codec_stream_slots", default=0)
+        self._offline_slots: int = self._connector_int("codec_offline_slots", default=0)
         self._stream_chunk_frames: int = self._connector_int("codec_chunk_frames", default=15)
         self._stream_max_step_frames: int = self._connector_int("codec_max_step_frames", default=100)
         self._stream_cudagraph_enabled = (
@@ -307,6 +360,7 @@ class MossTTSCodecDecoder(nn.Module):
         srs: list[torch.Tensor] = [sr_tensor] * num_req
         device = next(self._codec.parameters()).device
         streaming_work: list[tuple[int, str, torch.Tensor, bool]] = []
+        offline_session_work: list[tuple[int, torch.Tensor, int]] = []
 
         if input_ids is None or input_ids.numel() == 0:
             for i, wav in self._finish_empty_streaming_requests(info_list).items():
@@ -391,6 +445,10 @@ class MossTTSCodecDecoder(nn.Module):
                 streaming_work.append((i, req_key, codes_nq_t, finished))
                 continue
 
+            if self._stream_session is not None:
+                offline_session_work.append((i, codes_nq_t, left_ctx))
+                continue
+
             if self._cuda_graph_wrapper is not None:
                 out = self._cuda_graph_wrapper.decode(codes_nq_t)
             else:
@@ -406,19 +464,20 @@ class MossTTSCodecDecoder(nn.Module):
             if out.audio_lengths is not None:
                 wav = wav[..., : int(out.audio_lengths[0].item())]
 
-            # Trim left-context samples (per-channel sample axis, so the
-            # trim amount is identical for mono and interleaved-stereo).
-            if left_ctx > 0:
-                trim = min(left_ctx * self._codec.downsample_rate, wav.shape[-1])
-                if trim < left_ctx * self._codec.downsample_rate:
-                    logger.warning(
-                        "left_ctx trim (%d samples) exceeds wav length (%d); returning empty audio.",
-                        left_ctx * self._codec.downsample_rate,
-                        wav.shape[-1],
-                    )
-                wav = wav[..., trim:]
+            wav = self._trim_left_context(wav, left_ctx)
 
             audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
+
+        if offline_session_work:
+            session = self._ensure_stream_session()
+            if session is not None:
+                decoded = session.decode_offline(
+                    [codes for _, codes, _ in offline_session_work],
+                    max_step_frames=self._offline_step_frame_limit(),
+                )
+                for (i, _, left_ctx), wav in zip(offline_session_work, decoded):
+                    wav = self._trim_left_context(wav, left_ctx)
+                    audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
 
         if streaming_work:
             for i, wav in self._decode_streaming_batch(streaming_work).items():
@@ -434,8 +493,8 @@ class MossTTSCodecDecoder(nn.Module):
 
         Stage-0 can finish on a step that emits no new audio frame. The stage
         input processor forwards that as an empty payload with finished=true.
-        If a request never acquired a stream slot, do not offline-decode its
-        buffered codes here: streaming requests must only emit client deltas.
+        If a request never acquired a stream slot, drain buffered codes through
+        the offline lane so the final streaming delta is still delivered.
         """
         session = self._stream_session
         outputs: dict[int, torch.Tensor] = {}
@@ -454,13 +513,28 @@ class MossTTSCodecDecoder(nn.Module):
             slot = self._stream_req_slots.get(req_key)
             pending = req_key in self._stream_pending_codes
             if slot is not None or pending:
-                if pending and slot is None:
-                    logger.warning(
-                        "MOSS codec stream request %s finished before a codec stream slot became available; "
-                        "dropping buffered codes instead of offline-decoding a non-delta waveform.",
-                        req_key,
-                    )
-                self._finish_stream_request(req_key, session, slot)
+                try:
+                    if pending:
+                        pending_codes = self._pop_stream_pending(req_key)
+                        wav: torch.Tensor | None = None
+                        if pending_codes.numel() > 0:
+                            if slot is None:
+                                logger.warning(
+                                    "MOSS codec stream request %s finished before a codec stream slot became "
+                                    "available; decoding buffered codes through an offline codec slot.",
+                                    req_key,
+                                )
+                                wavs = session.decode_offline(
+                                    [pending_codes],
+                                    max_step_frames=self._offline_step_frame_limit(),
+                                )
+                                wav = wavs[0] if wavs else None
+                            else:
+                                wav = self._decode_stream_slot_sequence(session, slot, pending_codes)
+                        if wav is not None:
+                            outputs[i] = wav
+                finally:
+                    self._finish_stream_request(req_key, session, slot)
         return outputs
 
     @staticmethod
@@ -496,18 +570,36 @@ class MossTTSCodecDecoder(nn.Module):
             return torch.zeros((self._n_channels, 0), dtype=torch.float32)
         return torch.zeros((0,), dtype=torch.float32)
 
+    def _trim_left_context(self, wav: torch.Tensor, left_ctx: int) -> torch.Tensor:
+        if left_ctx <= 0 or self._codec is None:
+            return wav
+        trim_samples = left_ctx * self._codec.downsample_rate
+        trim = min(trim_samples, wav.shape[-1])
+        if trim < trim_samples:
+            logger.warning(
+                "left_ctx trim (%d samples) exceeds wav length (%d); returning empty audio.",
+                trim_samples,
+                wav.shape[-1],
+            )
+        return wav[..., trim:]
+
     def _ensure_stream_session(self) -> _MossCodecStreamSession | None:
         if self._codec is None:
             return None
         if self._stream_session is not None:
             return self._stream_session
         slots = self._stream_slots
+        offline_slots = self._offline_slots
         if slots <= 0:
             scheduler_cfg = getattr(self.vllm_config, "scheduler_config", None)
             slots = int(getattr(scheduler_cfg, "max_num_seqs", 1) or 1)
+        if offline_slots <= 0:
+            scheduler_cfg = getattr(self.vllm_config, "scheduler_config", None)
+            offline_slots = int(getattr(scheduler_cfg, "max_num_seqs", 1) or 1)
         self._stream_session = _MossCodecStreamSession(
             self._codec,
             stream_slots=max(1, slots),
+            offline_slots=max(1, offline_slots),
             n_vq=self._n_vq,
             enable_cuda_graph=self._stream_cudagraph_enabled,
             cuda_graph_capture_sizes=self._stream_cudagraph_capture_sizes(),
@@ -543,9 +635,17 @@ class MossTTSCodecDecoder(nn.Module):
                     if finished:
                         logger.warning(
                             "MOSS codec stream request %s finished before a codec stream slot became available; "
-                            "dropping buffered codes instead of offline-decoding a non-delta waveform.",
+                            "decoding buffered codes through an offline codec slot.",
                             request_id,
                         )
+                        replay_codes = self._pop_stream_pending(request_id)
+                        if replay_codes.numel() > 0:
+                            wavs = session.decode_offline(
+                                [replay_codes],
+                                max_step_frames=self._offline_step_frame_limit(),
+                            )
+                            if wavs:
+                                outputs[output_index] = wavs[0]
                         self._finish_stream_request(request_id, session, None)
                     continue
                 self._stream_req_slots[request_id] = slot
@@ -726,6 +826,9 @@ class MossTTSCodecDecoder(nn.Module):
         stream_chunk_frames = int(getattr(self, "_stream_chunk_frames", 15) or 15)
         max_step_frames = int(getattr(self, "_stream_max_step_frames", 100) or 100)
         return max(1, min(stream_chunk_frames, max_step_frames))
+
+    def _offline_step_frame_limit(self) -> int:
+        return max(1, int(getattr(self, "_stream_max_step_frames", 100) or 100))
 
     # ------------------------------------------------------------------
     # Weight loading

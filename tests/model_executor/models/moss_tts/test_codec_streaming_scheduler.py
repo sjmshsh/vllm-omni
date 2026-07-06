@@ -24,6 +24,44 @@ class _FakeStreamSession:
         return {slot: torch.ones((1, step_t), dtype=torch.float32)}
 
 
+class _FakeOfflineSession:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[tuple[int, int]], int]] = []
+        self.acquire_calls = 0
+        self.released: list[int] = []
+
+    def acquire(self) -> None:
+        self.acquire_calls += 1
+        return None
+
+    def release(self, slot: int) -> None:
+        self.released.append(slot)
+
+    def decode_offline(
+        self,
+        codes_list: list[torch.Tensor],
+        *,
+        max_step_frames: int,
+    ) -> list[torch.Tensor]:
+        self.calls.append(([tuple(codes.shape) for codes in codes_list], int(max_step_frames)))
+        return [torch.full((1, int(codes.shape[1])), float(index + 1)) for index, codes in enumerate(codes_list)]
+
+
+class _FakeCodecForForward:
+    def __init__(self) -> None:
+        self.config = type("_Cfg", (), {"codebook_size": 1024})()
+        self.downsample_rate = 1
+        self.batch_decode_calls = 0
+        self._param = torch.nn.Parameter(torch.zeros(()))
+
+    def parameters(self):
+        return iter([self._param])
+
+    def batch_decode(self, *args, **kwargs):
+        self.batch_decode_calls += 1
+        raise AssertionError("batch_decode should not run while a streaming session is active")
+
+
 class _FakeDecodeOutput:
     def __init__(self, audio: torch.Tensor, audio_lengths: torch.Tensor) -> None:
         self.audio = audio
@@ -95,6 +133,20 @@ def _decoder_stub(
     return decoder
 
 
+def _decoder_forward_stub() -> tuple[MossTTSCodecDecoder, _FakeCodecForForward]:
+    decoder = _decoder_stub(stream_chunk_frames=4, max_step_frames=7)
+    codec = _FakeCodecForForward()
+    object.__setattr__(decoder, "_codec", codec)
+    object.__setattr__(decoder, "_n_vq", 2)
+    object.__setattr__(decoder, "_n_channels", 1)
+    object.__setattr__(decoder, "_sr_tensor", torch.tensor(24_000, dtype=torch.int32))
+    object.__setattr__(decoder, "_cuda_graph_wrapper", None)
+    object.__setattr__(decoder, "_stream_req_slots", {})
+    object.__setattr__(decoder, "_stream_pending_codes", {})
+    object.__setattr__(decoder, "_stream_starved_reqs", set())
+    return decoder, codec
+
+
 def _session_stub(
     codec: _FakeStreamingCodec,
     wrapper: _FailingGraphWrapper | None,
@@ -142,6 +194,69 @@ def test_long_streaming_sequence_splits_at_steady_chunk_limit():
     assert session.step_sizes == [4, 4, 2]
     assert wav is not None
     assert tuple(wav.shape) == (1, 10)
+
+
+def test_decode_offline_uses_reserved_slots_and_splits_by_max_step():
+    session = _MossCodecStreamSession.__new__(_MossCodecStreamSession)
+    object.__setattr__(session, "_stream_slots", 3)
+    object.__setattr__(session, "_offline_slots", 2)
+    resets: list[list[int]] = []
+    steps: list[dict[int, int]] = []
+
+    def reset_slots(slots: list[int]) -> None:
+        resets.append(list(slots))
+
+    def step(plan: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+        steps.append({slot: int(codes.shape[1]) for slot, codes in plan.items()})
+        return {slot: torch.full((1, int(codes.shape[1])), float(slot)) for slot, codes in plan.items()}
+
+    object.__setattr__(session, "reset_slots", reset_slots)
+    object.__setattr__(session, "step", step)
+    codes = [
+        torch.zeros((2, 5), dtype=torch.long),
+        torch.zeros((2, 3), dtype=torch.long),
+        torch.zeros((2, 7), dtype=torch.long),
+    ]
+
+    wavs = session.decode_offline(codes, max_step_frames=4)
+
+    assert resets == [[3, 4], [3, 4], [3], [3]]
+    assert steps == [{3: 4}, {3: 1, 4: 1}, {4: 2}, {3: 4}, {3: 3}]
+    assert [tuple(wav.shape) for wav in wavs] == [(1, 5), (1, 3), (1, 7)]
+
+
+def test_non_streaming_decode_uses_offline_slots_when_stream_session_active():
+    decoder, codec = _decoder_forward_stub()
+    session = _FakeOfflineSession()
+    object.__setattr__(decoder, "_stream_session", session)
+
+    output = decoder.forward(
+        input_ids=torch.tensor([1, 2, 3, 4], dtype=torch.long),
+        runtime_additional_information=[{"meta": {}}],
+        seq_token_counts=[4],
+    )
+
+    assert codec.batch_decode_calls == 0
+    assert session.calls == [([(2, 2)], 7)]
+    wav = output.multimodal_outputs["model_outputs"][0]
+    assert torch.equal(wav, torch.ones(2))
+
+
+def test_slot_starved_finished_stream_decodes_buffered_codes_offline():
+    decoder, _ = _decoder_forward_stub()
+    session = _FakeOfflineSession()
+    object.__setattr__(decoder, "_stream_session", session)
+    object.__setattr__(decoder, "_ensure_stream_session", lambda: session)
+    codes = torch.zeros((2, 3), dtype=torch.long)
+
+    outputs = decoder._decode_streaming_batch([(0, "r", codes, True)])
+
+    assert session.acquire_calls == 1
+    assert session.calls == [([(2, 3)], 7)]
+    assert torch.equal(outputs[0], torch.ones((1, 3)))
+    assert decoder._stream_req_slots == {}
+    assert decoder._stream_pending_codes == {}
+    assert decoder._stream_starved_reqs == set()
 
 
 def test_streaming_graph_replay_failure_disables_runner_without_eager_retry():
