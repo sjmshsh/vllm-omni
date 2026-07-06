@@ -138,29 +138,39 @@ class _MossCodecStreamSession:
             exec_mask[slot] = True
 
         graph_out: tuple[torch.Tensor, torch.Tensor] | None = None
-        if self._cuda_graph_wrapper is not None:
-            try:
-                graph_out = self._cuda_graph_wrapper.decode_step(codes_step, exec_mask)
-            except Exception:
+        graph_failed = False
+        graph_used = False
+        try:
+            if self._cuda_graph_wrapper is not None:
+                try:
+                    graph_out = self._cuda_graph_wrapper.decode_step(codes_step, exec_mask)
+                except Exception:
+                    graph_failed = True
+                    raise
+            if graph_out is not None:
+                graph_used = True
+                audio, lengths = graph_out
+            else:
+                self._codec._set_streaming_exec_mask(exec_mask)
+                result = self._codec._decode_frame(codes_step, codes_lengths)
+                audio = result.audio
+                lengths = result.audio_lengths
+
+            if audio is None:
+                return {}
+            # CUDA Graph replay errors can surface asynchronously on materialization,
+            # so the D2H copy stays inside the replay failure guard.
+            audio_cpu = audio[slots].detach().to("cpu", torch.float32)
+            lengths_cpu = lengths[slots].detach().to("cpu") if lengths is not None else None
+        except Exception:
+            if self._cuda_graph_wrapper is not None and (graph_failed or graph_used):
                 logger.exception(
-                    "MOSS codec streaming CUDA Graph replay failed; disabling graph runner and using eager "
-                    "decode for this and subsequent chunks."
+                    "MOSS codec streaming CUDA Graph replay failed; disabling graph runner. "
+                    "The current streaming chunk will fail and subsequent chunks will use eager decode."
                 )
                 self._cuda_graph_wrapper.disable()
                 self._cuda_graph_wrapper = None
-                graph_out = None
-        if graph_out is not None:
-            audio, lengths = graph_out
-        else:
-            self._codec._set_streaming_exec_mask(exec_mask)
-            result = self._codec._decode_frame(codes_step, codes_lengths)
-            audio = result.audio
-            lengths = result.audio_lengths
-
-        if audio is None:
-            return {}
-        audio_cpu = audio[slots].detach().to("cpu", torch.float32)
-        lengths_cpu = lengths[slots].detach().to("cpu") if lengths is not None else None
+            raise
 
         out: dict[int, torch.Tensor] = {}
         for index, slot in enumerate(slots):
@@ -221,6 +231,7 @@ class MossTTSCodecDecoder(nn.Module):
         self._sr_tensor = torch.tensor(self._OUTPUT_SAMPLE_RATE, dtype=torch.int32)
         self._stream_session: _MossCodecStreamSession | None = None
         self._stream_slots: int = self._connector_int("codec_stream_slots", default=0)
+        self._stream_chunk_frames: int = self._connector_int("codec_chunk_frames", default=15)
         self._stream_max_step_frames: int = self._connector_int("codec_max_step_frames", default=100)
         self._stream_cudagraph_enabled = (
             not bool(getattr(vllm_config.model_config, "enforce_eager", True))
@@ -514,7 +525,7 @@ class MossTTSCodecDecoder(nn.Module):
 
         outputs: dict[int, torch.Tensor] = {}
         grouped: dict[int, list[tuple[int, str, int, torch.Tensor, bool]]] = {}
-        max_step_frames = max(1, int(self._stream_max_step_frames))
+        step_frame_limit = self._stream_step_frame_limit()
 
         for output_index, request_id, codes_nq_t, finished in items:
             pending = self._stream_pending_codes.get(request_id)
@@ -542,15 +553,23 @@ class MossTTSCodecDecoder(nn.Module):
             if pending:
                 self._append_stream_pending(request_id, codes_nq_t)
                 replay_codes = self._pop_stream_pending(request_id)
-                wav = self._decode_stream_slot_sequence(session, slot, replay_codes)
+                try:
+                    wav = self._decode_stream_slot_sequence(session, slot, replay_codes)
+                except Exception:
+                    self._finish_stream_request(request_id, session, slot)
+                    raise
                 if wav is not None:
                     outputs[output_index] = wav
                 if finished:
                     self._finish_stream_request(request_id, session, slot)
                 continue
 
-            if int(codes_nq_t.shape[1]) > max_step_frames:
-                wav = self._decode_stream_slot_sequence(session, slot, codes_nq_t)
+            if int(codes_nq_t.shape[1]) > step_frame_limit:
+                try:
+                    wav = self._decode_stream_slot_sequence(session, slot, codes_nq_t)
+                except Exception:
+                    self._finish_stream_request(request_id, session, slot)
+                    raise
                 if wav is not None:
                     outputs[output_index] = wav
                 if finished:
@@ -563,7 +582,12 @@ class MossTTSCodecDecoder(nn.Module):
 
         for group in grouped.values():
             plan = {slot: codes_nq_t for _, _, slot, codes_nq_t, _ in group}
-            decoded = session.step(plan)
+            try:
+                decoded = session.step(plan)
+            except Exception:
+                for _, request_id, slot, _, _ in group:
+                    self._finish_stream_request(request_id, session, slot)
+                raise
             for output_index, request_id, slot, _, finished in group:
                 wav = decoded.get(slot)
                 if wav is not None:
@@ -592,10 +616,10 @@ class MossTTSCodecDecoder(nn.Module):
     ) -> torch.Tensor | None:
         if codes_nq_t.numel() == 0:
             return None
-        max_step_frames = max(1, int(self._stream_max_step_frames))
+        step_frame_limit = self._stream_step_frame_limit()
         parts: list[torch.Tensor] = []
-        for start in range(0, int(codes_nq_t.shape[1]), max_step_frames):
-            chunk = codes_nq_t[:, start : start + max_step_frames]
+        for start in range(0, int(codes_nq_t.shape[1]), step_frame_limit):
+            chunk = codes_nq_t[:, start : start + step_frame_limit]
             decoded = session.step({slot: chunk})
             wav = decoded.get(slot)
             if wav is not None:
@@ -688,9 +712,20 @@ class MossTTSCodecDecoder(nn.Module):
         configured = self._connector_int_list("stream_decode_cudagraph_capture_sizes")
         if configured:
             return configured
-        steady_chunk_frames = self._connector_int("codec_chunk_frames", default=15)
-        ceiling = max(1, min(int(steady_chunk_frames), int(self._stream_max_step_frames)))
-        return list(range(1, ceiling + 1))
+        return list(range(1, self._stream_step_frame_limit() + 1))
+
+    def _stream_step_frame_limit(self) -> int:
+        """Cap streaming codec steps to the steady chunk size.
+
+        This mirrors SGLang-Omni's MOSS Local streaming vocoder: the scheduler
+        captures CUDA Graphs for every T in ``1..stream_chunk_frames`` and caps
+        backlog/final-tail decode steps at that same ceiling. That keeps the
+        normal streaming path on captured exact-T graphs instead of relying on
+        large, sparsely used fallback shapes.
+        """
+        stream_chunk_frames = int(getattr(self, "_stream_chunk_frames", 15) or 15)
+        max_step_frames = int(getattr(self, "_stream_max_step_frames", 100) or 100)
+        return max(1, min(stream_chunk_frames, max_step_frames))
 
     # ------------------------------------------------------------------
     # Weight loading
