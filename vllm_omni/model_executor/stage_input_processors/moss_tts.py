@@ -270,11 +270,31 @@ def talker2codec_raw_async_chunk(
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     cfg = cfg if isinstance(cfg, dict) else {}
     chunk_frames = int(cfg.get("codec_chunk_frames", 15) or 15)
-    initial_chunk_frames = int(cfg.get("initial_codec_chunk_frames") or 0)
+    configured_initial_chunk_frames = int(cfg.get("initial_codec_chunk_frames") or 0)
+    initial_chunk_frames = configured_initial_chunk_frames
+
+    additional_information = getattr(request, "additional_information", None)
+    if (
+        additional_information is not None
+        and hasattr(additional_information, "entries")
+        and "initial_codec_chunk_frames" in additional_information.entries
+    ):
+        entry = additional_information.entries["initial_codec_chunk_frames"]
+        if entry.list_data is not None and len(entry.list_data) == 1:
+            initial_chunk_frames = int(entry.list_data[0])
+
     if chunk_frames <= 0:
         raise ValueError(f"codec_chunk_frames must be positive for MOSS raw streaming, got {chunk_frames}")
+    if configured_initial_chunk_frames < 0:
+        raise ValueError(
+            "initial_codec_chunk_frames must be non-negative for MOSS raw streaming, "
+            f"got {configured_initial_chunk_frames}"
+        )
     if initial_chunk_frames < 0:
-        raise ValueError(f"initial_codec_chunk_frames must be non-negative, got {initial_chunk_frames}")
+        raise ValueError(
+            "initial_codec_chunk_frames must be non-negative for MOSS raw streaming, "
+            f"got {initial_chunk_frames}"
+        )
     if initial_chunk_frames > chunk_frames:
         logger.warning(
             "initial_codec_chunk_frames=%d > codec_chunk_frames=%d, clamping.",

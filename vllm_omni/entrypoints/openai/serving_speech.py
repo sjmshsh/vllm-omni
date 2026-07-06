@@ -1903,6 +1903,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
+            if request.initial_codec_chunk_frames is not None:
+                params["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
             wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
             params["prompt_audio_array"] = [[wav_list, sr]]
             return params
@@ -1992,6 +1994,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         }
         if request.max_new_tokens is not None:
             params["max_new_frames"] = [request.max_new_tokens]
+        if request.initial_codec_chunk_frames is not None:
+            params["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
         return params
 
     def _validate_higgs_audio_v2_request(self, request: OpenAICreateSpeechRequest) -> str | None:

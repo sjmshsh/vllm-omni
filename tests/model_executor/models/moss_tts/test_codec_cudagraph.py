@@ -14,6 +14,7 @@ from vllm_omni.model_executor.models.moss_tts.audio_tokenizer import (
 )
 from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
     MossTTSCUDAGraphCodecWrapper,
+    MossTTSStreamingCUDAGraphCodecWrapper,
 )
 
 pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
@@ -80,6 +81,69 @@ class SyntheticCodecModel(nn.Module):
             codes[:nq, i, : c.shape[-1]] = c[:nq]
             lengths[i] = c.shape[-1]
         return self._decode(codes, lengths)
+
+
+class _SyntheticStreamingState:
+    def __init__(self, batch_size: int, device: torch.device) -> None:
+        self.device = device
+        self.exec_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        self.offset = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    def set_exec_mask(self, exec_mask: torch.Tensor) -> None:
+        self.exec_mask[:] = exec_mask.to(self.device)
+
+    def reset(self, reset_mask: torch.Tensor) -> None:
+        reset_mask = reset_mask.to(self.device)
+        self.exec_mask[:] = torch.where(reset_mask, torch.ones_like(self.exec_mask), self.exec_mask)
+        self.offset[:] = torch.where(reset_mask, torch.zeros_like(self.offset), self.offset)
+
+
+class SyntheticStreamingCodecModel(nn.Module):
+    """Stateful streaming codec stub with graph-friendly in-place state updates."""
+
+    def __init__(
+        self,
+        num_quantizers: int = NUM_QUANTIZERS,
+        downsample_rate: int = DOWNSAMPLE_RATE,
+    ) -> None:
+        super().__init__()
+        self.num_quantizers = num_quantizers
+        self.downsample_rate = downsample_rate
+        self.scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
+        self._streaming_state: _SyntheticStreamingState | None = None
+
+    def streaming(self, batch_size: int):
+        model = self
+
+        class _StreamingContext:
+            def __enter__(self):
+                model._streaming_state = _SyntheticStreamingState(batch_size, model.scale.device)
+                return model._streaming_state
+
+            def __exit__(self, exc_type, exc, tb):
+                model._streaming_state = None
+
+        return _StreamingContext()
+
+    def _set_streaming_exec_mask(self, exec_mask: torch.Tensor) -> None:
+        assert self._streaming_state is not None
+        self._streaming_state.set_exec_mask(exec_mask)
+
+    def _decode_frame(self, codes: torch.Tensor, lengths: torch.Tensor) -> MossAudioTokenizerDecoderOutput:
+        state = self._streaming_state
+        assert state is not None
+        nq, batch_size, step_t = codes.shape
+        assert nq == self.num_quantizers
+
+        positions = (
+            state.offset.view(batch_size, 1)
+            + torch.arange(step_t, device=codes.device, dtype=state.offset.dtype).view(1, step_t)
+        )
+        frame_values = codes.sum(dim=0).to(dtype=self.scale.dtype) + positions.to(dtype=self.scale.dtype)
+        audio = (frame_values * self.scale).repeat_interleave(self.downsample_rate, dim=-1).unsqueeze(1)
+        audio_lengths = lengths * self.downsample_rate
+        state.offset[:] = torch.where(state.exec_mask, state.offset + step_t, state.offset)
+        return MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=audio_lengths)
 
 
 # ---------------------------------------------------------------------------
@@ -359,3 +423,73 @@ def test_empty_input_t0(model, wrapper):
     with torch.no_grad():
         out = wrapper.decode(codes)
     assert out.audio.shape[-1] == 0, f"expected empty audio, got shape {out.audio.shape}"
+
+
+# ---------------------------------------------------------------------------
+# 13. Stateful streaming CUDA Graph
+# ---------------------------------------------------------------------------
+
+
+def test_streaming_cudagraph_matches_eager_with_exec_mask():
+    batch_size = 3
+    torch.manual_seed(123)
+    graph_model = SyntheticStreamingCodecModel().to(DEVICE).eval()
+    eager_model = SyntheticStreamingCodecModel().to(DEVICE).eval()
+    eager_model.load_state_dict(graph_model.state_dict())
+
+    with graph_model.streaming(batch_size), eager_model.streaming(batch_size):
+        wrapper_stream = MossTTSStreamingCUDAGraphCodecWrapper(
+            model=graph_model,
+            capture_sizes=[2, 3],
+            num_quantizers=NUM_QUANTIZERS,
+            batch_size=batch_size,
+            min_free_gb=0.0,
+            enabled=True,
+        )
+        wrapper_stream.warmup(DEVICE)
+        assert wrapper_stream.captured_sizes() == [2, 3]
+
+        for step_t, active_slots in ((2, [0, 2]), (3, [1, 2]), (2, [0])):
+            codes = torch.randint(
+                0,
+                64,
+                (NUM_QUANTIZERS, batch_size, step_t),
+                dtype=torch.long,
+                device=DEVICE,
+            )
+            lengths = torch.full((batch_size,), step_t, dtype=torch.long, device=DEVICE)
+            exec_mask = torch.zeros(batch_size, dtype=torch.bool, device=DEVICE)
+            exec_mask[active_slots] = True
+
+            eager_model._set_streaming_exec_mask(exec_mask)
+            ref = eager_model._decode_frame(codes, lengths)
+            out = wrapper_stream.decode_step(codes, exec_mask)
+
+            assert out is not None
+            audio, audio_lengths = out
+            torch.testing.assert_close(audio[active_slots], ref.audio[active_slots], atol=0, rtol=0)
+            torch.testing.assert_close(
+                audio_lengths[active_slots],
+                ref.audio_lengths[active_slots],
+                atol=0,
+                rtol=0,
+            )
+
+
+def test_streaming_cudagraph_missing_t_returns_none():
+    batch_size = 2
+    model_stream = SyntheticStreamingCodecModel().to(DEVICE).eval()
+    with model_stream.streaming(batch_size):
+        wrapper_stream = MossTTSStreamingCUDAGraphCodecWrapper(
+            model=model_stream,
+            capture_sizes=[2],
+            num_quantizers=NUM_QUANTIZERS,
+            batch_size=batch_size,
+            min_free_gb=0.0,
+            enabled=True,
+        )
+        wrapper_stream.warmup(DEVICE)
+
+        codes = torch.randint(0, 64, (NUM_QUANTIZERS, batch_size, 4), dtype=torch.long, device=DEVICE)
+        exec_mask = torch.ones(batch_size, dtype=torch.bool, device=DEVICE)
+        assert wrapper_stream.decode_step(codes, exec_mask) is None
