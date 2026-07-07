@@ -28,7 +28,6 @@ from vllm_omni.model_executor.models.moss_tts.configuration_moss_audio_tokenizer
 )
 from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
     MossTTSCUDAGraphCodecWrapper,
-    MossTTSStreamingCUDAGraphCodecWrapper,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -44,9 +43,6 @@ class _MossCodecStreamSession:
         *,
         stream_slots: int,
         n_vq: int,
-        enable_cuda_graph: bool = False,
-        cuda_graph_capture_sizes: list[int] | None = None,
-        cuda_graph_min_free_gb: float = 3.0,
     ) -> None:
         self._codec = codec
         self._stream_slots = int(stream_slots)
@@ -56,29 +52,8 @@ class _MossCodecStreamSession:
         self._free_stream_slots = list(range(self._stream_slots))
         self._exit_stack = contextlib.ExitStack()
         self._closed = False
-        self._cuda_graph_wrapper: MossTTSStreamingCUDAGraphCodecWrapper | None = None
         with torch.no_grad():
             self._exit_stack.enter_context(codec.streaming(self._batch_size))
-            if enable_cuda_graph and cuda_graph_capture_sizes:
-                self._cuda_graph_wrapper = MossTTSStreamingCUDAGraphCodecWrapper(
-                    model=codec,
-                    capture_sizes=cuda_graph_capture_sizes,
-                    num_quantizers=self._n_vq,
-                    batch_size=self._batch_size,
-                    min_free_gb=cuda_graph_min_free_gb,
-                    enabled=True,
-                )
-                try:
-                    self._cuda_graph_wrapper.warmup(self._device)
-                except Exception:
-                    logger.warning(
-                        "MOSS codec streaming CUDA Graph warmup failed; serving streaming codec eagerly.",
-                        exc_info=True,
-                    )
-                    self._cuda_graph_wrapper = None
-                else:
-                    if not self._cuda_graph_wrapper.captured_sizes():
-                        self._cuda_graph_wrapper = None
 
     def acquire(self) -> int | None:
         if not self._free_stream_slots:
@@ -98,32 +73,16 @@ class _MossCodecStreamSession:
         reset_mask[slots] = True
 
         def _reset(module: nn.Module) -> None:
-            # ``_streaming_state`` is set on every StreamingModule while the
-            # codec is inside ``codec.streaming(batch_size)``; non-streaming
-            # submodules simply do not define it. ``hasattr`` + direct access
-            # avoids ``getattr`` per project convention.
-            if not hasattr(module, "_streaming_state"):
-                return
-            state = module._streaming_state
+            state = getattr(module, "_streaming_state", None)
             if state is not None:
                 state.reset(reset_mask.to(state.device))
 
         with torch.no_grad():
             self._codec.apply(_reset)
 
-    def has_cuda_graph(self) -> bool:
-        """True when at least one per-T streaming graph is captured and live."""
-        return self._cuda_graph_wrapper is not None and self._cuda_graph_wrapper.has_captured()
-
-    def captured_sizes(self) -> list[int]:
-        """Sorted list of frame counts backed by a captured CUDA graph."""
-        return self._cuda_graph_wrapper.captured_sizes() if self._cuda_graph_wrapper is not None else []
-
     def close(self) -> None:
         if self._closed:
             return
-        if self._cuda_graph_wrapper is not None:
-            self._cuda_graph_wrapper.log_stats()
         with torch.no_grad():
             self._exit_stack.close()
         self._closed = True
@@ -145,52 +104,22 @@ class _MossCodecStreamSession:
         )
         codes_lengths = torch.zeros(self._batch_size, dtype=torch.long, device=self._device)
         exec_mask = torch.zeros(self._batch_size, dtype=torch.bool, device=self._device)
-        slots = list(slot_codes)
         for slot, codes in slot_codes.items():
             codes_step[:, slot, :] = codes.to(device=self._device, dtype=torch.long)
             codes_lengths[slot] = int(codes.shape[1])
             exec_mask[slot] = True
 
-        graph_out: tuple[torch.Tensor, torch.Tensor] | None = None
-        graph_failed = False
-        graph_used = False
-        try:
-            if self._cuda_graph_wrapper is not None:
-                try:
-                    graph_out = self._cuda_graph_wrapper.decode_step(codes_step, exec_mask)
-                except Exception:
-                    graph_failed = True
-                    raise
-            if graph_out is not None:
-                graph_used = True
-                audio, lengths = graph_out
-            else:
-                self._codec._set_streaming_exec_mask(exec_mask)
-                result = self._codec._decode_frame(codes_step, codes_lengths)
-                audio = result.audio
-                lengths = result.audio_lengths
-
-            if audio is None:
-                return {}
-            # CUDA Graph replay errors can surface asynchronously on materialization,
-            # so the D2H copy stays inside the replay failure guard.
-            audio_cpu = audio[slots].detach().to("cpu", torch.float32)
-            lengths_cpu = lengths[slots].detach().to("cpu") if lengths is not None else None
-        except Exception:
-            if self._cuda_graph_wrapper is not None and (graph_failed or graph_used):
-                logger.exception(
-                    "MOSS codec streaming CUDA Graph replay failed; disabling graph runner. "
-                    "The current streaming chunk will fail and subsequent chunks will use eager decode."
-                )
-                self._cuda_graph_wrapper.disable()
-                self._cuda_graph_wrapper = None
-            raise
-
+        self._codec._set_streaming_exec_mask(exec_mask)
+        result = self._codec._decode_frame(codes_step, codes_lengths)
+        if result.audio is None:
+            return {}
+        audio = result.audio.detach().to("cpu", torch.float32)
+        lengths = result.audio_lengths.detach().to("cpu") if result.audio_lengths is not None else None
         out: dict[int, torch.Tensor] = {}
-        for index, slot in enumerate(slots):
-            wav = audio_cpu[index]
-            if lengths_cpu is not None:
-                wav = wav[..., : int(lengths_cpu[index].item())]
+        for slot in slot_codes:
+            wav = audio[slot]
+            if lengths is not None:
+                wav = wav[..., : int(lengths[slot].item())]
             out[slot] = wav.contiguous()
         return out
 
@@ -228,24 +157,14 @@ class MossTTSCodecDecoder(nn.Module):
         self.vllm_config = vllm_config
 
         cfg = vllm_config.model_config.hf_config
-        # ``n_vq`` is the current MOSS naming; some vendored variants still
-        # ship the older ``rvq``. Fall through direct attribute access +
-        # ``hasattr`` (project convention forbids ``getattr``).
-        if hasattr(cfg, "n_vq"):
-            self._n_vq: int = int(cfg.n_vq)
-        elif hasattr(cfg, "rvq"):
-            self._n_vq = int(cfg.rvq)
-        else:
-            self._n_vq = 16
-        # Same story for the codec checkpoint path: modern configs use
-        # ``codec_model_name_or_path``; the legacy vendored config exposes
-        # ``audio_tokenizer_name_or_path``.
-        if hasattr(cfg, "codec_model_name_or_path"):
-            self._codec_path: str = str(cfg.codec_model_name_or_path)
-        elif hasattr(cfg, "audio_tokenizer_name_or_path"):
-            self._codec_path = str(cfg.audio_tokenizer_name_or_path)
-        else:
-            self._codec_path = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
+        self._n_vq: int = int(getattr(cfg, "n_vq", getattr(cfg, "rvq", 16)))
+        self._codec_path: str = str(
+            getattr(
+                cfg,
+                "codec_model_name_or_path",
+                getattr(cfg, "audio_tokenizer_name_or_path", "OpenMOSS-Team/MOSS-Audio-Tokenizer"),
+            )
+        )
 
         # Resolved at load_weights() time, once the codec checkpoint's own
         # config (sampling rate, channel count) is known.
@@ -255,15 +174,7 @@ class MossTTSCodecDecoder(nn.Module):
         self._sr_tensor = torch.tensor(self._OUTPUT_SAMPLE_RATE, dtype=torch.int32)
         self._stream_session: _MossCodecStreamSession | None = None
         self._stream_slots: int = self._connector_int("codec_stream_slots", default=0)
-        self._stream_chunk_frames: int = self._connector_int("codec_chunk_frames", default=15)
         self._stream_max_step_frames: int = self._connector_int("codec_max_step_frames", default=100)
-        # ``enforce_eager`` is a first-class field on vLLM's ModelConfig;
-        # access it directly rather than via ``getattr``.
-        self._stream_cudagraph_enabled = (
-            not bool(vllm_config.model_config.enforce_eager)
-            and self._connector_bool("codec_streaming_cudagraph", default=True)
-        )
-        self._stream_cudagraph_min_free_gb = self._connector_float("cuda_graph_min_free_gb", default=3.0)
         self._stream_req_slots: dict[str, int] = {}
         self._stream_pending_codes: dict[str, list[torch.Tensor]] = {}
         self._stream_starved_reqs: set[str] = set()
@@ -432,7 +343,17 @@ class MossTTSCodecDecoder(nn.Module):
             if out.audio_lengths is not None:
                 wav = wav[..., : int(out.audio_lengths[0].item())]
 
-            wav = self._trim_left_context(wav, left_ctx)
+            # Trim left-context samples (per-channel sample axis, so the
+            # trim amount is identical for mono and interleaved-stereo).
+            if left_ctx > 0:
+                trim = min(left_ctx * self._codec.downsample_rate, wav.shape[-1])
+                if trim < left_ctx * self._codec.downsample_rate:
+                    logger.warning(
+                        "left_ctx trim (%d samples) exceeds wav length (%d); returning empty audio.",
+                        left_ctx * self._codec.downsample_rate,
+                        wav.shape[-1],
+                    )
+                wav = wav[..., trim:]
 
             audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
 
@@ -450,9 +371,8 @@ class MossTTSCodecDecoder(nn.Module):
 
         Stage-0 can finish on a step that emits no new audio frame. The stage
         input processor forwards that as an empty payload with finished=true.
-        Any buffered codes for a request that never acquired a stream slot are
-        drained through the streaming session's held slot so the final delta
-        is delivered.
+        If a request never acquired a stream slot, do not offline-decode its
+        buffered codes here: streaming requests must only emit client deltas.
         """
         session = self._stream_session
         outputs: dict[int, torch.Tensor] = {}
@@ -471,15 +391,13 @@ class MossTTSCodecDecoder(nn.Module):
             slot = self._stream_req_slots.get(req_key)
             pending = req_key in self._stream_pending_codes
             if slot is not None or pending:
-                try:
-                    if pending and slot is not None:
-                        pending_codes = self._pop_stream_pending(req_key)
-                        if pending_codes.numel() > 0:
-                            wav = self._decode_stream_slot_sequence(session, slot, pending_codes)
-                            if wav is not None:
-                                outputs[i] = wav
-                finally:
-                    self._finish_stream_request(req_key, session, slot)
+                if pending and slot is None:
+                    logger.warning(
+                        "MOSS codec stream request %s finished before a codec stream slot became available; "
+                        "dropping buffered codes instead of offline-decoding a non-delta waveform.",
+                        req_key,
+                    )
+                self._finish_stream_request(req_key, session, slot)
         return outputs
 
     @staticmethod
@@ -515,42 +433,19 @@ class MossTTSCodecDecoder(nn.Module):
             return torch.zeros((self._n_channels, 0), dtype=torch.float32)
         return torch.zeros((0,), dtype=torch.float32)
 
-    def _trim_left_context(self, wav: torch.Tensor, left_ctx: int) -> torch.Tensor:
-        if left_ctx <= 0 or self._codec is None:
-            return wav
-        trim_samples = left_ctx * self._codec.downsample_rate
-        trim = min(trim_samples, wav.shape[-1])
-        if trim < trim_samples:
-            logger.warning(
-                "left_ctx trim (%d samples) exceeds wav length (%d); returning empty audio.",
-                trim_samples,
-                wav.shape[-1],
-            )
-        return wav[..., trim:]
-
     def _ensure_stream_session(self) -> _MossCodecStreamSession | None:
         if self._codec is None:
             return None
         if self._stream_session is not None:
             return self._stream_session
         slots = self._stream_slots
-        # ``vllm_config.scheduler_config.max_num_seqs`` is always populated in
-        # a live vLLM engine, but we keep a defensive fallback (1) for unit
-        # tests that pass a bare-bones config.
-        default_slots = 1
-        if hasattr(self.vllm_config, "scheduler_config"):
-            scheduler_cfg = self.vllm_config.scheduler_config
-            if scheduler_cfg is not None and hasattr(scheduler_cfg, "max_num_seqs"):
-                default_slots = int(scheduler_cfg.max_num_seqs or 1)
         if slots <= 0:
-            slots = default_slots
+            scheduler_cfg = getattr(self.vllm_config, "scheduler_config", None)
+            slots = int(getattr(scheduler_cfg, "max_num_seqs", 1) or 1)
         self._stream_session = _MossCodecStreamSession(
             self._codec,
             stream_slots=max(1, slots),
             n_vq=self._n_vq,
-            enable_cuda_graph=self._stream_cudagraph_enabled,
-            cuda_graph_capture_sizes=self._stream_cudagraph_capture_sizes(),
-            cuda_graph_min_free_gb=self._stream_cudagraph_min_free_gb,
         )
         return self._stream_session
 
@@ -564,7 +459,7 @@ class MossTTSCodecDecoder(nn.Module):
 
         outputs: dict[int, torch.Tensor] = {}
         grouped: dict[int, list[tuple[int, str, int, torch.Tensor, bool]]] = {}
-        step_frame_limit = self._stream_step_frame_limit()
+        max_step_frames = max(1, int(self._stream_max_step_frames))
 
         for output_index, request_id, codes_nq_t, finished in items:
             pending = self._stream_pending_codes.get(request_id)
@@ -582,7 +477,7 @@ class MossTTSCodecDecoder(nn.Module):
                     if finished:
                         logger.warning(
                             "MOSS codec stream request %s finished before a codec stream slot became available; "
-                            "dropping buffered codes.",
+                            "dropping buffered codes instead of offline-decoding a non-delta waveform.",
                             request_id,
                         )
                         self._finish_stream_request(request_id, session, None)
@@ -592,23 +487,15 @@ class MossTTSCodecDecoder(nn.Module):
             if pending:
                 self._append_stream_pending(request_id, codes_nq_t)
                 replay_codes = self._pop_stream_pending(request_id)
-                try:
-                    wav = self._decode_stream_slot_sequence(session, slot, replay_codes)
-                except Exception:
-                    self._finish_stream_request(request_id, session, slot)
-                    raise
+                wav = self._decode_stream_slot_sequence(session, slot, replay_codes)
                 if wav is not None:
                     outputs[output_index] = wav
                 if finished:
                     self._finish_stream_request(request_id, session, slot)
                 continue
 
-            if int(codes_nq_t.shape[1]) > step_frame_limit:
-                try:
-                    wav = self._decode_stream_slot_sequence(session, slot, codes_nq_t)
-                except Exception:
-                    self._finish_stream_request(request_id, session, slot)
-                    raise
+            if int(codes_nq_t.shape[1]) > max_step_frames:
+                wav = self._decode_stream_slot_sequence(session, slot, codes_nq_t)
                 if wav is not None:
                     outputs[output_index] = wav
                 if finished:
@@ -621,12 +508,7 @@ class MossTTSCodecDecoder(nn.Module):
 
         for group in grouped.values():
             plan = {slot: codes_nq_t for _, _, slot, codes_nq_t, _ in group}
-            try:
-                decoded = session.step(plan)
-            except Exception:
-                for _, request_id, slot, _, _ in group:
-                    self._finish_stream_request(request_id, session, slot)
-                raise
+            decoded = session.step(plan)
             for output_index, request_id, slot, _, finished in group:
                 wav = decoded.get(slot)
                 if wav is not None:
@@ -655,10 +537,10 @@ class MossTTSCodecDecoder(nn.Module):
     ) -> torch.Tensor | None:
         if codes_nq_t.numel() == 0:
             return None
-        step_frame_limit = self._stream_step_frame_limit()
+        max_step_frames = max(1, int(self._stream_max_step_frames))
         parts: list[torch.Tensor] = []
-        for start in range(0, int(codes_nq_t.shape[1]), step_frame_limit):
-            chunk = codes_nq_t[:, start : start + step_frame_limit]
+        for start in range(0, int(codes_nq_t.shape[1]), max_step_frames):
+            chunk = codes_nq_t[:, start : start + max_step_frames]
             decoded = session.step({slot: chunk})
             wav = decoded.get(slot)
             if wav is not None:
@@ -705,78 +587,15 @@ class MossTTSCodecDecoder(nn.Module):
                 self._stream_starved_reqs.discard(request_id)
 
     def _connector_int(self, name: str, default: int = 0) -> int:
-        value = self._connector_value(name)
-        if value is not None:
-            return int(value)
-        return default
-
-    def _connector_float(self, name: str, default: float = 0.0) -> float:
-        value = self._connector_value(name)
-        if value is not None:
-            return float(value)
-        return default
-
-    def _connector_bool(self, name: str, default: bool = False) -> bool:
-        value = self._connector_value(name)
-        if value is None:
-            return default
-        if isinstance(value, str):
-            return value.strip().lower() not in {"0", "false", "off", "no"}
-        return bool(value)
-
-    def _connector_int_list(self, name: str) -> list[int] | None:
-        value = self._connector_value(name)
-        if value is None:
-            return None
-        if isinstance(value, str):
-            parsed = [int(v.strip()) for v in value.split(",") if v.strip()]
-        elif isinstance(value, (list, tuple)):
-            parsed = [int(v) for v in value]
-        else:
-            parsed = [int(value)]
-        return sorted({v for v in parsed if v > 0})
-
-    def _connector_value(self, name: str) -> Any:
-        # ``vllm_config.model_config`` is always present on the vLLM engine's
-        # config object; ``stage_connector_config`` is a vLLM-Omni extension
-        # so its presence is optional. Use ``hasattr`` + direct access
-        # (avoids ``getattr`` per project convention).
-        if not hasattr(self.vllm_config, "model_config"):
-            return None
-        model_cfg = self.vllm_config.model_config
-        if model_cfg is None or not hasattr(model_cfg, "stage_connector_config"):
-            return None
-        connector_cfg = model_cfg.stage_connector_config
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
         if isinstance(connector_cfg, dict):
             extra_cfg: dict | None = connector_cfg.get("extra", connector_cfg)
-        elif connector_cfg is not None and hasattr(connector_cfg, "extra"):
-            extra_cfg = connector_cfg.extra
         else:
-            extra_cfg = None
+            extra_cfg = getattr(connector_cfg, "extra", None)
         if isinstance(extra_cfg, dict) and name in extra_cfg:
-            return extra_cfg[name]
-        return None
-
-    def _stream_cudagraph_capture_sizes(self) -> list[int]:
-        configured = self._connector_int_list("stream_decode_cudagraph_capture_sizes")
-        if configured:
-            return configured
-        return list(range(1, self._stream_step_frame_limit() + 1))
-
-    def _stream_step_frame_limit(self) -> int:
-        """Cap streaming codec steps to the steady chunk size.
-
-        This mirrors SGLang-Omni's MOSS Local streaming vocoder: the scheduler
-        captures CUDA Graphs for every T in ``1..stream_chunk_frames`` and caps
-        backlog/final-tail decode steps at that same ceiling. That keeps the
-        normal streaming path on captured exact-T graphs instead of relying on
-        large, sparsely used fallback shapes.
-        """
-        # Both attributes are always initialised in ``__init__``; direct access
-        # per project convention.
-        stream_chunk_frames = int(self._stream_chunk_frames or 15)
-        max_step_frames = int(self._stream_max_step_frames or 100)
-        return max(1, min(stream_chunk_frames, max_step_frames))
+            return int(extra_cfg[name])
+        return default
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -880,14 +699,14 @@ class MossTTSCodecDecoder(nn.Module):
         codec.eval()
         self._codec = codec
         inferred_channels = 2 if "v2" in codec_path.lower() else 1
-        # v2 configs expose ``number_channels``; the legacy vendored config
-        # uses ``num_channels``; fall back to a path-based inference.
-        if hasattr(codec_cfg, "number_channels") and codec_cfg.number_channels:
-            self._n_channels = int(codec_cfg.number_channels)
-        elif hasattr(codec_cfg, "num_channels") and codec_cfg.num_channels:
-            self._n_channels = int(codec_cfg.num_channels)
-        else:
-            self._n_channels = int(inferred_channels)
+        self._n_channels = int(
+            getattr(
+                codec_cfg,
+                "number_channels",
+                getattr(codec_cfg, "num_channels", inferred_channels),
+            )
+            or inferred_channels
+        )
         self._sr_tensor = torch.tensor(int(codec_cfg.sampling_rate), dtype=torch.int32)
 
         logger.info(
@@ -899,63 +718,11 @@ class MossTTSCodecDecoder(nn.Module):
 
         self._maybe_enable_decoder_cudagraph(device)
 
-        # Factory-time streaming CUDA-graph warmup. Aligned with SGLang-Omni's
-        # ``scheduler.warmup_now()``: we capture the exact-T streaming graphs
-        # at load-time -- codec weights are on device, the GPU is quiescent,
-        # and this runs before the stage process is marked ready to serve. The
-        # first streaming request therefore hits an already-warm session
-        # instead of paying the (potentially multi-second) capture cost inline.
-        # The call is best-effort: on non-CUDA devices, when streaming
-        # cudagraph is disabled, or on capture failure the session degrades to
-        # eager and serving continues.
-        self.warmup_now()
-
         # vLLM's track_weights_loading() compares the returned set against
         # ``self.named_parameters()``. After ``self._codec = codec`` above,
         # those parameters are registered with the ``_codec.`` prefix, so
         # mirror that here.
         return {f"_codec.{name}" for name, _ in codec.named_parameters()}
-
-    # ------------------------------------------------------------------
-    # Factory-time warmup
-    # ------------------------------------------------------------------
-
-    def warmup_now(self) -> None:
-        """Eagerly build the streaming session and capture its CUDA graphs.
-
-        Mirrors SGLang-Omni's ``MossTTSLocalStreamingVocoderScheduler.warmup_now``:
-        capturing at factory build time (before the stage process is ready to
-        serve) avoids racing a half-captured graph with the serving loop and
-        removes the first-streaming-request TTFA spike caused by lazy graph
-        capture. Safe to call multiple times -- it no-ops once the session
-        already exists.
-        """
-        if self._codec is None:
-            return
-        if self._stream_session is not None:
-            return
-        if not self._stream_cudagraph_enabled:
-            # No graph to capture; there is no benefit to eagerly building the
-            # streaming session either -- offline non-streaming requests are
-            # served through ``self._cuda_graph_wrapper`` (or eager ``batch_decode``)
-            # and never touch the streaming session.
-            return
-        device = next(self._codec.parameters()).device
-        if device.type != "cuda":
-            return
-        session = self._ensure_stream_session()
-        if session is None:
-            return
-        if session.has_cuda_graph():
-            logger.info(
-                "MOSS-TTS streaming codec CUDA graphs captured at startup: T=%s",
-                session.captured_sizes(),
-            )
-        else:
-            logger.warning(
-                "MOSS-TTS streaming codec CUDA graphs did not seal at startup "
-                "(disabled, low VRAM, or capture failure); serving eager.",
-            )
 
     def _build_codec(self, codec_path: str) -> tuple[Any, nn.Module]:
         try:
@@ -974,30 +741,32 @@ class MossTTSCodecDecoder(nn.Module):
 
     def _maybe_enable_decoder_cudagraph(self, device: torch.device) -> None:
         """Capture CUDA Graphs for the codec decoder if enforce_eager is False."""
-        # ``enforce_eager`` is a first-class ModelConfig field; direct access.
-        if self.vllm_config.model_config.enforce_eager:
+        if getattr(self.vllm_config.model_config, "enforce_eager", True):
             return
         if self._codec is None:
-            return
-        if not self._connector_bool("decode_cudagraph", default=True):
             return
 
         # Read capture sizes from the connector's extra config (same convention
         # as Qwen3-TTS), falling back to a sensible default covering common
         # codec_chunk_frames values used in moss_tts.yaml.
-        capture_sizes = self._connector_int_list("decode_cudagraph_capture_sizes") or [
-            4,
-            8,
-            16,
-            25,
-            32,
-            50,
-            64,
-            100,
-            128,
-            200,
-            256,
-        ]
+        capture_sizes: list[int] = [4, 8, 16, 25, 32, 50, 64, 100, 128, 200, 256]
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            extra_cfg: dict | None = connector_cfg.get("extra", connector_cfg)
+        else:
+            extra_cfg = getattr(connector_cfg, "extra", None)
+        if isinstance(extra_cfg, dict):
+            raw = extra_cfg.get("decode_cudagraph_capture_sizes")
+            if raw is not None:
+                if isinstance(raw, (list, tuple)):
+                    parsed = sorted({int(v) for v in raw if int(v) > 0})
+                elif isinstance(raw, str):
+                    parsed = sorted({int(v.strip()) for v in raw.split(",") if v.strip()})
+                else:
+                    parsed = [int(raw)]
+                if parsed:
+                    capture_sizes = parsed
 
         self._cuda_graph_wrapper = MossTTSCUDAGraphCodecWrapper(
             model=self._codec,
