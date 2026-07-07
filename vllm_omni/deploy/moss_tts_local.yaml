@@ -18,6 +18,10 @@ connectors:
       codec_chunk_frames: 15          # 15 frames * 80 ms/frame = 1.2 s steady chunks
       codec_left_context_frames: 0
       codec_stream_slots: 8
+      codec_max_step_frames: 100
+      codec_streaming_cudagraph: true
+      cuda_graph_min_free_gb: 3.0
+      decode_cudagraph: false
 
 stages:
   - stage_id: 0
@@ -41,7 +45,7 @@ stages:
   - stage_id: 1
     max_num_seqs: 8
     gpu_memory_utilization: 0.15
-    enforce_eager: true
+    enforce_eager: true  # Must be true: prevents vLLM's own graph from padding input_ids, which breaks seq_token_counts
     enable_prefix_caching: false
     async_scheduling: true
     max_num_batched_tokens: 65536
