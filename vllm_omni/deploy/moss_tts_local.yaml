@@ -19,9 +19,6 @@ connectors:
       codec_left_context_frames: 0
       codec_stream_slots: 8
       codec_max_step_frames: 100
-      codec_streaming_cudagraph: true
-      cuda_graph_min_free_gb: 3.0
-      decode_cudagraph: false
 
 stages:
   - stage_id: 0
@@ -45,12 +42,18 @@ stages:
   - stage_id: 1
     max_num_seqs: 8
     gpu_memory_utilization: 0.15
-    enforce_eager: true  # Must be true: prevents vLLM's own graph from padding input_ids, which breaks seq_token_counts
+    enforce_eager: false  # Enables vLLM and streaming-codec CUDA Graphs.
     enable_prefix_caching: false
     async_scheduling: true
     max_num_batched_tokens: 65536
     max_model_len: 65536
     devices: "0"
+    compilation_config:
+      cudagraph_mode: FULL_AND_PIECEWISE
+      # vLLM capture sizes are flattened token counts. Each codec frame has
+      # n_vq=12 tokens, so these buckets cover streaming steps of 1..15 frames.
+      cudagraph_capture_sizes: [12, 24, 36, 48, 60, 72, 84, 96, 108, 120, 132, 144, 156, 168, 180]
+      cudagraph_num_of_warmups: 3
     input_connectors:
       from_stage_0: shm
     default_sampling_params:

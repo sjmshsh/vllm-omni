@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -46,7 +46,7 @@ class _MossCodecStreamSession:
         n_vq: int,
         enable_cuda_graph: bool = False,
         cuda_graph_capture_sizes: list[int] | None = None,
-        cuda_graph_min_free_gb: float = 3.0,
+        cuda_graph_num_of_warmups: int | None = None,
     ) -> None:
         self._codec = codec
         self._stream_slots = int(stream_slots)
@@ -65,7 +65,7 @@ class _MossCodecStreamSession:
                     capture_sizes=cuda_graph_capture_sizes,
                     num_quantizers=self._n_vq,
                     batch_size=self._batch_size,
-                    min_free_gb=cuda_graph_min_free_gb,
+                    warmup_iters=cuda_graph_num_of_warmups,
                     enabled=True,
                 )
                 try:
@@ -257,21 +257,6 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_slots: int = self._connector_int("codec_stream_slots", default=0)
         self._stream_chunk_frames: int = self._connector_int("codec_chunk_frames", default=15)
         self._stream_max_step_frames: int = self._connector_int("codec_max_step_frames", default=100)
-        # Streaming CUDA graph is controlled solely by the connector config key
-        # ``codec_streaming_cudagraph``.  We do NOT gate it on vLLM's
-        # ``enforce_eager`` because ``enforce_eager`` also enables vLLM's own
-        # CUDA-graph capture for the codec's ``forward()`` pass.  That capture
-        # pads ``input_ids`` to the nearest captured size (e.g. 12 → 16),
-        # which causes a ``seq_token_counts`` mismatch inside ``forward()`` and
-        # crashes the engine.  The streaming graph wrapper uses its own
-        # independent ``torch.cuda.graph()`` context inside the streaming
-        # session and therefore does not require vLLM's ``enforce_eager=False``.
-        # Stage-1 should keep ``enforce_eager: true`` in the deploy YAML so
-        # that vLLM's own graph capture is suppressed.
-        self._stream_cudagraph_enabled = self._connector_bool(
-            "codec_streaming_cudagraph", default=False
-        )
-        self._stream_cudagraph_min_free_gb = self._connector_float("cuda_graph_min_free_gb", default=3.0)
         self._stream_req_slots: dict[str, int] = {}
         self._stream_pending_codes: dict[str, list[torch.Tensor]] = {}
         self._stream_starved_reqs: set[str] = set()
@@ -360,11 +345,16 @@ class MossTTSCodecDecoder(nn.Module):
                 "MossTTS codec requires seq_token_counts; otherwise concatenated "
                 "codec tokens cannot be split per request."
             )
-        if sum(token_counts) != int(ids_flat.shape[0]):
+        input_token_count = sum(token_counts)
+        if input_token_count > int(ids_flat.shape[0]):
             raise RuntimeError(
                 "MossTTS codec seq_token_counts mismatch: "
-                f"counts={token_counts}, sum={sum(token_counts)}, input_tokens={int(ids_flat.shape[0])}."
+                f"counts={token_counts}, sum={input_token_count}, input_tokens={int(ids_flat.shape[0])}."
             )
+        # vLLM CUDA Graph replay pads the flattened input to a configured
+        # capture size. seq_token_counts describes the real request payload,
+        # so discard only that trailing runner padding before splitting.
+        ids_flat = ids_flat[:input_token_count]
 
         num_req = len(token_counts)
         if len(info_list) < num_req:
@@ -556,9 +546,9 @@ class MossTTSCodecDecoder(nn.Module):
             self._codec,
             stream_slots=max(1, slots),
             n_vq=self._n_vq,
-            enable_cuda_graph=self._stream_cudagraph_enabled,
+            enable_cuda_graph=self._stream_cudagraph_enabled(),
             cuda_graph_capture_sizes=self._stream_cudagraph_capture_sizes(),
-            cuda_graph_min_free_gb=self._stream_cudagraph_min_free_gb,
+            cuda_graph_num_of_warmups=self._stream_cudagraph_num_of_warmups(),
         )
         return self._stream_session
 
@@ -718,12 +708,6 @@ class MossTTSCodecDecoder(nn.Module):
             return int(value)
         return default
 
-    def _connector_float(self, name: str, default: float = 0.0) -> float:
-        value = self._connector_value(name)
-        if value is not None:
-            return float(value)
-        return default
-
     def _connector_bool(self, name: str, default: bool = False) -> bool:
         value = self._connector_value(name)
         if value is None:
@@ -766,10 +750,22 @@ class MossTTSCodecDecoder(nn.Module):
         return None
 
     def _stream_cudagraph_capture_sizes(self) -> list[int]:
-        configured = self._connector_int_list("stream_decode_cudagraph_capture_sizes")
-        if configured:
-            return configured
-        return list(range(1, self._stream_step_frame_limit() + 1))
+        compilation_config = self.vllm_config.compilation_config
+        frame_sizes = {
+            int(size) // self._n_vq
+            for size in compilation_config.cudagraph_capture_sizes
+            if int(size) > 0 and int(size) % self._n_vq == 0
+        }
+        return sorted(size for size in frame_sizes if size <= self._stream_step_frame_limit())
+
+    def _stream_cudagraph_enabled(self) -> bool:
+        """Follow vLLM's ``enforce_eager`` CUDA Graph switch."""
+        return not self.vllm_config.model_config.enforce_eager and bool(
+            self._stream_cudagraph_capture_sizes()
+        )
+
+    def _stream_cudagraph_num_of_warmups(self) -> int:
+        return int(self.vllm_config.compilation_config.cudagraph_num_of_warmups)
 
     def _stream_step_frame_limit(self) -> int:
         """Cap streaming codec steps to the steady chunk size.
@@ -942,7 +938,7 @@ class MossTTSCodecDecoder(nn.Module):
             return
         if self._stream_session is not None:
             return
-        if not self._stream_cudagraph_enabled:
+        if not self._stream_cudagraph_enabled():
             # No graph to capture; there is no benefit to eagerly building the
             # streaming session either -- offline non-streaming requests are
             # served through ``self._cuda_graph_wrapper`` (or eager ``batch_decode``)
@@ -981,8 +977,12 @@ class MossTTSCodecDecoder(nn.Module):
         return codec_cfg, codec
 
     def _maybe_enable_decoder_cudagraph(self, device: torch.device) -> None:
-        """Capture CUDA Graphs for the codec decoder if enforce_eager is False."""
-        # ``enforce_eager`` is a first-class ModelConfig field; direct access.
+        """Enable the legacy inner decoder graph when vLLM graphs are off."""
+        # Do not nest the codec's legacy graph replay inside a vLLM graph.
+        # Deployments using vLLM's compilation config rely on the outer graph;
+        # the custom wrapper remains only for backward-compatible configs.
+        if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            return
         if self.vllm_config.model_config.enforce_eager:
             return
         if self._codec is None:
@@ -990,9 +990,6 @@ class MossTTSCodecDecoder(nn.Module):
         if not self._connector_bool("decode_cudagraph", default=True):
             return
 
-        # Read capture sizes from the connector's extra config (same convention
-        # as Qwen3-TTS), falling back to a sensible default covering common
-        # codec_chunk_frames values used in moss_tts.yaml.
         capture_sizes = self._connector_int_list("decode_cudagraph_capture_sizes") or [
             4,
             8,
