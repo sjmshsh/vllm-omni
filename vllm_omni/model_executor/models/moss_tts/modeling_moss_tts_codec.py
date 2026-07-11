@@ -708,14 +708,6 @@ class MossTTSCodecDecoder(nn.Module):
             return int(value)
         return default
 
-    def _connector_bool(self, name: str, default: bool = False) -> bool:
-        value = self._connector_value(name)
-        if value is None:
-            return default
-        if isinstance(value, str):
-            return value.strip().lower() not in {"0", "false", "off", "no"}
-        return bool(value)
-
     def _connector_int_list(self, name: str) -> list[int] | None:
         value = self._connector_value(name)
         if value is None:
@@ -759,9 +751,11 @@ class MossTTSCodecDecoder(nn.Module):
         return sorted(size for size in frame_sizes if size <= self._stream_step_frame_limit())
 
     def _stream_cudagraph_enabled(self) -> bool:
-        """Follow vLLM's ``enforce_eager`` CUDA Graph switch."""
-        return not self.vllm_config.model_config.enforce_eager and bool(
-            self._stream_cudagraph_capture_sizes()
+        """Follow vLLM's CUDA Graph switches."""
+        return (
+            not self.vllm_config.model_config.enforce_eager
+            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and bool(self._stream_cudagraph_capture_sizes())
         )
 
     def _stream_cudagraph_num_of_warmups(self) -> int:
@@ -986,8 +980,6 @@ class MossTTSCodecDecoder(nn.Module):
         if self.vllm_config.model_config.enforce_eager:
             return
         if self._codec is None:
-            return
-        if not self._connector_bool("decode_cudagraph", default=True):
             return
 
         capture_sizes = self._connector_int_list("decode_cudagraph_capture_sizes") or [
